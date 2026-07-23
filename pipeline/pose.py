@@ -70,7 +70,8 @@ def median_parallax(pts1, pts2):
     return float(np.median(np.linalg.norm(pts2 - pts1, axis=1)))
 
 
-def render_trajectory(positions, map_points=None, provisional_points=None, size=600, margin=40):
+def render_trajectory(positions, map_points=None, provisional_points=None, ml_points=None,
+                       size=600, margin=40):
     """
     Render the top-down (X, Z) camera trajectory + sparse map into a BGR image.
 
@@ -78,6 +79,9 @@ def render_trajectory(positions, map_points=None, provisional_points=None, size=
     given, are drawn orange - unconfirmed points awaiting independent
     re-observation before being trusted. A point moves from one to the other
     automatically across frames as its confirmed status changes upstream.
+    ml_points, if given, are drawn light blue - ML-depth-derived points (see
+    pipeline/depth_ml.py), plotted for visual sanity-checking only; they are
+    not part of the map used for pose estimation.
     """
     canvas = np.full((size, size, 3), 255, dtype=np.uint8)
 
@@ -92,13 +96,31 @@ def render_trajectory(positions, map_points=None, provisional_points=None, size=
         if provisional_points is not None and len(provisional_points) > 0
         else np.empty((0, 2))
     )
+    ml_xz = (
+        np.asarray(ml_points).reshape(-1, 3)[:, [0, 2]]
+        if ml_points is not None and len(ml_points) > 0
+        else np.empty((0, 2))
+    )
 
     if len(pos_xz) < 2:
         return canvas
 
-    all_xz = np.vstack([a for a in (pos_xz, map_xz, prov_xz) if len(a)])
-    min_xy = all_xz.min(axis=0)
-    max_xy = all_xz.max(axis=0)
+    all_xz = np.vstack([a for a in (pos_xz, map_xz, prov_xz, ml_xz) if len(a)])
+    # Percentile bounds rather than literal min/max - a single outlier point
+    # (e.g. an ML-depth point that's still somewhat off despite the upstream
+    # sanity checks) would otherwise dictate the whole canvas's scale on its
+    # own, shrinking the majority of real structure down to an unreadable
+    # speck. A point outside this range still gets drawn - to_canvas doesn't
+    # clip - it just may land outside the visible canvas.
+    #
+    # The camera trajectory itself is exempted from being clipped this way -
+    # unlike the point clouds, it's already pose-plausibility-checked
+    # upstream (--max-plausible-rotation/--max-step-ratio), so it isn't the
+    # thing outliers come from, and losing sight of "where the camera even
+    # is" would defeat the point of the plot. Expand the bounds to always
+    # cover it fully, on top of (never instead of) the robust point bounds.
+    min_xy = np.minimum(np.percentile(all_xz, 2, axis=0), pos_xz.min(axis=0))
+    max_xy = np.maximum(np.percentile(all_xz, 98, axis=0), pos_xz.max(axis=0))
     span = np.maximum(max_xy - min_xy, 1e-3)
     scale = (size - 2 * margin) / span.max()
 
@@ -107,6 +129,8 @@ def render_trajectory(positions, map_points=None, provisional_points=None, size=
         y = int((p[1] - min_xy[1]) * scale + margin)
         return x, size - y  # flip so +Z (forward) points up
 
+    for p in ml_xz:
+        cv2.circle(canvas, to_canvas(p), 1, (230, 216, 173), -1)  # light blue - ML depth (unverified)
     for p in prov_xz:
         cv2.circle(canvas, to_canvas(p), 2, (0, 165, 255), -1)  # orange (BGR) - provisional
     for p in map_xz:
