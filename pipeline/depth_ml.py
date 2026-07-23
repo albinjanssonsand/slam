@@ -73,6 +73,26 @@ def colorize_depth(depth, colormap=cv2.COLORMAP_INFERNO):
     return cv2.applyColorMap(depth_8u, colormap)
 
 
+def colorize_depth_with_background(depth, background_mask, colormap=cv2.COLORMAP_INFERNO, alpha=0.45):
+    """
+    Same as colorize_depth, with the detected background region (see
+    detect_background_mask) tinted grey - makes it visible which area
+    scanline densification is excluding (everything NOT tinted is a
+    candidate for new points), without fully hiding the underlying depth
+    coloring there the way a solid overlay would.
+    """
+    vis = colorize_depth(depth, colormap)
+    grey_overlay = vis.copy()
+    grey_overlay[background_mask] = (128, 128, 128)
+    vis = cv2.addWeighted(vis, 1 - alpha, grey_overlay, alpha, 0)
+
+    cv2.putText(vis, "ML depth estimate", (10, 25),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(vis, "gray = excluded background", (10, 50),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
+    return vis
+
+
 def render_colorbar(d_min, d_max, height, width=70, colormap=cv2.COLORMAP_INFERNO, n_ticks=5):
     """
     Vertical legend for colorize_depth's colormap. Oriented to match
@@ -204,44 +224,78 @@ def fit_disparity_scale_shift(disparity, inv_depth):
     return float(a), float(b)
 
 
-def detect_object_mask(depth, edge_percentile=90, max_background_frac=0.15):
+def detect_background_mask(frame_image, edge_percentile=85, max_background_frac=0.15, close_ksize=9):
     """
-    Very simple region segmentation to tell discrete objects apart from
-    smoothly-varying background (floor/walls) - motivated by scanline
-    densification otherwise producing a repeated "streak" every keyframe
-    wherever a scanline just crosses open floor, which carries no real
-    object information and is pure clutter.
+    Very simple region segmentation to identify large, continuous
+    background surfaces (floor/walls) so scanline densification can exclude
+    them - motivated by scanline points otherwise producing a repeated
+    "streak" every keyframe wherever a scanline just crosses open floor,
+    which carries no real object information and is pure clutter.
 
-    Method: threshold the depth gradient magnitude to get edges, then treat
-    connected regions of non-edge pixels as candidate flat surfaces. A
-    continuous floor or wall dominates the frame by sheer pixel area in a
-    way a discrete object doesn't, so the largest region(s) are assumed to
-    be background and everything else is assumed to be "object."
+    Deliberately identifies background, not objects: an earlier version
+    tried to positively identify and whitelist discrete objects, capped to
+    the max_objects largest candidates - in practice this rejected too many
+    real objects (anything not confidently segmented as its own region got
+    excluded). Background is a much easier, more forgiving thing to
+    identify reliably: it's just "the large regions". Everything NOT
+    flagged as background is allowed through as a candidate for new points,
+    so a missed/imperfect object segmentation costs nothing - only actually
+    mislabeling floor/wall as non-background does.
 
-    edge_percentile is relative (not an absolute gradient magnitude), since
-    the model's raw disparity has no fixed scale - the steepest
-    edge_percentile% of gradient magnitudes in this frame are treated as
-    edges. max_background_frac is the minimum fraction of the frame a flat
-    region must cover to count as background rather than an object.
+    Runs on the grayscale camera image, not the depth map - tried depth
+    gradient first, but an object resting ON the floor has no depth STEP
+    right at the contact line (they're physically touching, so the depth
+    genuinely is continuous there), so depth-edge detection can't separate
+    them: the object's base merges into the floor's connected region, and
+    depending how much of the object that connection drags in, the whole
+    object can end up mislabeled as floor. A plane-fit-and-flag-deviation
+    approach was tried as a depth-only fix and rejected - background
+    regularly spans multiple real surfaces at once (e.g. floor + far wall)
+    that no single plane fits, and a large nearby object leaves too little
+    true background in its own neighborhood for local background estimation
+    to see past it either. The camera image doesn't have this problem: an
+    object's outline is a real visual (texture/lighting/color) boundary
+    against the floor even where its depth blends smoothly, confirmed by
+    inspecting the edge map directly - a test cabinet's full silhouette,
+    including the base, showed up as a clean closed contour while the floor
+    itself stayed almost entirely edge-free.
 
-    Returns a boolean mask, True where a pixel belongs to a small ("object")
-    region rather than the dominant background or an edge itself.
+    Method: Sobel gradient on grayscale, thresholded at the edge_percentile
+    (relative, not an absolute magnitude - lighting/exposure varies per
+    frame), opened to remove thin noise specks, then CLOSED (close_ksize) to
+    seal small gaps in real object outlines - without this, a one-pixel gap
+    in an otherwise-complete boundary lets the connected-components flood
+    fill leak between the object's interior and the floor, silently
+    merging them back together despite an almost-complete outline.
+    Connected components of the remaining non-edge pixels are the candidate
+    flat surfaces; background isn't always a single dominant blob - floor
+    and a far wall/ceiling reliably separate into two comparably-sized
+    regions rather than merging into one (confirmed empirically: 30.2% vs
+    30.1% on one test frame) - so any region over max_background_frac
+    counts as background, not just the single largest.
+
+    Returns a boolean mask, True where a pixel belongs to a large
+    background region.
     """
-    depth = depth.astype(np.float32)
-    grad_x = cv2.Sobel(depth, cv2.CV_32F, 1, 0, ksize=3)
-    grad_y = cv2.Sobel(depth, cv2.CV_32F, 0, 1, ksize=3)
+    gray = cv2.cvtColor(frame_image, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
     grad_mag = cv2.magnitude(grad_x, grad_y)
     edge_threshold = np.percentile(grad_mag, edge_percentile)
-    non_edge = (grad_mag <= edge_threshold).astype(np.uint8)
+    edges = (grad_mag > edge_threshold).astype(np.uint8)
+    edges = cv2.morphologyEx(edges, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, np.ones((close_ksize, close_ksize), np.uint8))
+    non_edge = 1 - edges
 
     n_labels, labels = cv2.connectedComponents(non_edge, connectivity=4)
     sizes = np.bincount(labels.ravel(), minlength=n_labels)
-    total = labels.size
     # Label 0 is the edge pixels themselves (cv2 treats 0-valued input as
-    # background) - never "object", same as an oversized flat region.
-    background_labels = set(np.where(sizes > max_background_frac * total)[0]) | {0}
+    # background) - excluded so it can never itself be flagged as background.
+    sizes[0] = 0
+    total = labels.size
+    background_labels = np.where(sizes > max_background_frac * total)[0]
 
-    return ~np.isin(labels, list(background_labels))
+    return np.isin(labels, background_labels)
 
 
 def render_scanline_profiles(rows_xz, size=600, margin=40, n_ticks=5):

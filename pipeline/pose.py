@@ -130,7 +130,7 @@ def render_trajectory(positions, map_points=None, provisional_points=None, ml_po
         return x, size - y  # flip so +Z (forward) points up
 
     for p in ml_xz:
-        cv2.circle(canvas, to_canvas(p), 1, (230, 216, 173), -1)  # light blue - ML depth (unverified)
+        cv2.circle(canvas, to_canvas(p), 1, (139, 0, 0), -1)  # dark blue - ML depth (unverified)
     for p in prov_xz:
         cv2.circle(canvas, to_canvas(p), 2, (0, 165, 255), -1)  # orange (BGR) - provisional
     for p in map_xz:
