@@ -14,9 +14,9 @@ Three planned versions:
 - **v3** — Fuse the phone's IMU to improve tracking through fast motion, low-texture
   scenes, and to help resolve scale drift.
 
-## Recorded video vs. real-time first
+## Recorded video vs. real-time video stream
 
-**Start with a recorded video, not live streaming.**
+**Starting with a recorded video, not live streaming.**
 
 Reasons:
 
@@ -104,7 +104,7 @@ Pipeline stages:
    rather than attempting pose estimation on every consecutive frame — adjacent
    frames at typical frame rates rarely have enough baseline for a well-conditioned
    essential matrix / PnP solve.
-8. **Local map / bundle adjustment (optional but recommended)** — a lightweight
+8. **Local map / bundle adjustment** — a lightweight
    local bundle adjustment (e.g. via `scipy.optimize.least_squares` or `g2opy`/
    `gtsam` bindings) to jointly refine recent keyframe poses and map points. This is
    also the natural way to reduce per-point triangulation noise when only a small
@@ -115,7 +115,7 @@ Pipeline stages:
 
 Known limitations to accept in v1: no loop closure, fragile in low-texture or
 fast-rotation scenes, and monocular scale is arbitrary (fixed by the bootstrap step,
-not metric) — motivates v2/v3.
+not metric). This motivates v2/v3.
 
 ### v1 Components / Libraries
 
@@ -127,7 +127,7 @@ not metric) — motivates v2/v3.
 
 ---
 
-## Version 2 — Add ML Monocular Depth Estimation
+## Version 2 — ML Monocular Depth Estimation
 
 **Goal:** improve scale consistency and provide dense-ish depth to complement the
 sparse geometric point cloud, especially in low-texture regions where ORB fails.
@@ -246,7 +246,7 @@ slam/
   distances along the viewing ray. Fixed by rejecting points below a minimum
   parallax angle. Even after that fix, an early simple validation test (near
   object + far background, sliding sideways) produced a "smeared" point cloud with
-  no clean separation between the two depths — root cause was that the *real*
+  no clean separation between the two depths. Root cause was that the *real*
   camera baseline per keyframe pair was still too small relative to the scene's
   depth for the surviving points, so ordinary feature-matching noise was enough to
   blur what should have been two tight clusters into a continuous spread. Fixed by
@@ -254,7 +254,7 @@ slam/
   real baseline), which validated cleanly: two correctly-ordered, tightly separated
   near/far depth clusters.
 - [x] Confirmed empirically (not just in theory) that chaining independent two-view
-  poses keyframe-to-keyframe drifts in scale — motivating the mapping stage below.
+  poses keyframe-to-keyframe drifts in scale which motivates the mapping stage below.
 - [x] `pipeline/mapping.py` — persistent `Map` (3D points + one ORB descriptor each),
   bootstrapped once via two-view pose+triangulation, then extended via PnP
   (`cv2.solvePnPRansac`) tracking for every subsequent keyframe, per the
@@ -272,8 +272,7 @@ slam/
   internally-inconsistent map (older points vs. newer points), showing up as more
   and more "inliers" actually being rejected by PnP RANSAC. This is a different,
   arguably worse failure mode than the old pose-only scale drift, since errors are
-  now baked into permanent structure rather than just the pose chain — and it's
-  exactly what local bundle adjustment (step 8) exists to correct.
+  now baked into permanent structure rather than just the pose chain. Local bundle adjustment might correct this to correct.
 
 - [x] `pipeline/bundle_adjustment.py` — sliding-window local bundle adjustment
   (`scipy.optimize.least_squares`), jointly refining recent keyframe poses and the
@@ -292,7 +291,7 @@ slam/
     loosened convergence tolerances/iteration cap - this refines an
     already-good PnP/triangulation estimate, not a from-scratch solve, so it
     doesn't need to grind toward high-precision convergence.
-  - **Naive point capping caused trajectories to go "absolutely crazy."**
+  - **Naive point capping caused trajectories jump**
     Capping to the globally most-recent N points could strip a keyframe's
     observations down to almost nothing if it mostly re-observed old map
     points rather than contributing new ones (the normal steady-state TRACK
@@ -314,7 +313,8 @@ slam/
   Diagnosed as a systematic bias, not noise: the fixed global ORB feature budget
   (`nfeatures=2000`) was dominated by whichever region had the strongest texture
   (a near foreground object), starving the background of features from the very
-  start (user-confirmed: "a lot of orbs in the foreground but not background").
+  start (confirmed by inspecting the recording: a lot of ORB keypoints in the
+  foreground but not the background).
   As the foreground left the frame over the course of the slide, tracking was
   forced onto an increasingly thin set of background points - which, as
   established earlier, inherently has smaller parallax angle for the same
@@ -335,10 +335,9 @@ slam/
   clouds separate into correct near/far depth clusters, and the PnP inlier ratio
   stays healthy across full sequences instead of decaying.
 
-## Post-acceptance investigation: rotation + long trajectories
+## Further improvements trajectory, map-quality, and pose-ambiguity fixes
 
-After v1 was accepted below, a longer recording with a non-straight path (moving
-past several objects, turning corners) surfaced two more issues worth recording.
+A longer demo recording with a non-straight path (moving past several objects, turning corners) surfaced more issues worth recording.
 
 - [x] **Rotation combined with translation still broke tracking**, even though
   pure-rotation handling (below) worked. Root cause: our keyframe/triangulation
@@ -390,8 +389,6 @@ past several objects, turning corners) surfaced two more issues worth recording.
   (below) rather than keep layering fixes at a problem the architecture can't
   fully solve without loop closure or periodic global BA.
 
-## Post-acceptance investigation, continued: provisional/confirmed map points
-
 Following up on the rotation+translation sprinkler problem: further logs showed a
 single keyframe transition (the one with the largest rotation in a stretch) could
 triangulate a huge one-shot batch of brand-new points (1000+) sharing that one
@@ -427,11 +424,9 @@ self-consistent while still being collectively wrong.
   calibration/capture-layer fixes are all solving different, non-overlapping
   problems and remain necessary.
 
-## Post-acceptance investigation, continued: confirmed-pool starvation, BA's limits as a fixer, and PnP pose ambiguity
-
-Further testing of `--confirm-count` and continued erratic-trajectory reports
-surfaced several distinct problems in sequence - each one initially looked like
-it might be the same root cause as the last, but turned out not to be.
+Continued testing of `--confirm-count` and further erratic-trajectory reports
+surfaced several more distinct problems in sequence - each one initially looked
+like it might be the same root cause as the last, but turned out not to be.
 
 - [x] **`--confirm-count 2` starves the PnP-eligible pool.** Requiring 2
   independent re-observations before a point counts as confirmed shrinks the
@@ -444,7 +439,7 @@ it might be the same root cause as the last, but turned out not to be.
   - Tried: a fallback PnP path (confirmed-only first; if too thin, retry
     against the full confirmed+provisional pool to keep the trajectory
     continuous, but without letting that fallback pose extend the map).
-    **User-tested and found it did not help** - reverted/removed rather than
+    **Tested and found it did not help** - reverted/removed rather than
     kept as unused complexity.
 - [x] **Diagnosed why BA doesn't clean up an isolated erratic keyframe**, after
   observing the trajectory "snapping back" to the correct path a keyframe or
