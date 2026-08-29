@@ -142,6 +142,47 @@ sparse geometric point cloud, especially in low-texture regions where ORB fails.
 - Fuse ML depth with geometric triangulation depth (e.g. weighted by triangulation
   confidence/parallax) rather than replacing the geometric estimate outright.
 
+**Why this helps, and what it changes in v1:** v1's remaining weaknesses mostly trace back to one root cause: geometric triangulation only
+produces a point where two keyframes see it from a large-enough baseline angle,
+and has no path to real-world scale on its own. A dense, per-pixel ML depth
+estimate doesn't depend on feature matches or baseline at all, so it attacks
+that root cause directly:
+
+- Monocular scale is arbitrary, fixed once by the two-view bootstrap and never
+  metric (v1's known limitations) - an ML depth model trained on real depth
+  data gives an actual real-world reference to anchor against, instead of an
+  arbitrary one.
+- Low-texture backgrounds and the min-triangulation-angle "sprinkler" rejection
+  (`pipeline/triangulation.py`) both stem from needing enough matched-feature
+  baseline to triangulate at all - dense depth exists independent of that, so
+  it can fill exactly the regions geometric triangulation is weakest in or must
+  reject.
+- The provisional/confirmed point lifecycle (`mapping.py`) exists to guard
+  against trusting a single two-view triangulation that could be biased - an
+  ML depth estimate for the same pixel is a second, independent source of
+  truth that could corroborate a new point immediately, rather than waiting on
+  `--confirm-count` future re-observations.
+- The heuristic PnP-pose plausibility guards (`--max-plausible-rotation`,
+  `--max-step-ratio`) exist only because there's currently no independent check
+  on a solved pose besides reprojection error against the map itself - a dense
+  depth map is an outside signal that could eventually replace those
+  heuristics with an actual consistency residual.
+
+None of v1's stages need to be torn out for this - v2 is additive. Likely
+affected parts, roughly in the order they'd actually change:
+
+1. **Bootstrap scale** - swap the arbitrary two-view scale for one anchored
+   against ML depth.
+2. **Triangulation gaps** (`pipeline/triangulation.py`'s parallax-angle
+   rejection) - fill rejected/low-texture regions with ML depth instead of
+   leaving them absent from the map.
+3. **Point confirmation** (`Map`'s provisional/confirmed lifecycle) - could
+   shorten or skip the multi-observation wait once ML depth agrees with a
+   fresh triangulation.
+4. **Pose plausibility checks** (`--max-plausible-rotation`/`--max-step-ratio`)
+   - the most invasive, longest-term change: replace the ad hoc thresholds
+   with a real depth-consistency check.
+
 ### v2 Additional Components
 
 - `torch` + a pretrained depth model checkpoint (or `onnxruntime` for a lighter
@@ -204,7 +245,7 @@ slam/
   main.py                  # wires frame source -> pipeline -> viz
 ```
 
-## Progress so far
+## v1 Development log
 
 - [x] Camera calibration (`calibration/calibrate.py`) + undistortion sanity check
   (`calibration/verify_undistort.py`). Problems hit along the way:
@@ -335,7 +376,7 @@ slam/
   clouds separate into correct near/far depth clusters, and the PnP inlier ratio
   stays healthy across full sequences instead of decaying.
 
-## Further improvements trajectory, map-quality, and pose-ambiguity fixes
+### Further improvements trajectory, map-quality, and pose-ambiguity fixes
 
 A longer demo recording with a non-straight path (moving past several objects, turning corners) surfaced more issues worth recording.
 
@@ -511,7 +552,7 @@ like it might be the same root cause as the last, but turned out not to be.
   screen. Now scaled down to fit within 1600x900 if needed before `imshow`,
   preserving aspect ratio, so nothing renders off-screen.
 
-## v1 status: complete (accepted 2026-07-21)
+## v1 status: complete (2026-07-22)
 
 The full stage 1-9 pipeline above (frame source → preprocessing → ORB feature
 detection/matching → bootstrap-then-track pose estimation → triangulation →
@@ -548,6 +589,22 @@ What's left is refinement and deferred items, not missing core functionality:
    `--ratio 0.75` (the defaults); `--ba-window`/`--ba-every`/`--ba-max-points`/
    `--min-triangulation-angle` may still need re-tuning per scene.
 
-None of these block calling v1 "done" for its original scope (classical ORB +
-geometric SLAM on recorded video). Loop closure/culling can stay deferred, or v2
-(ML depth) can start, once live capture is validated.
+
+## v2 Development log
+
+- [x] **Model: Depth Anything V2 Small**, fp32 ONNX export, downloaded from
+  `onnx-community/depth-anything-v2-small` on Hugging Face to
+  `pipeline/models/depth_anything_v2_vits.onnx`.
+- [x] **Runtime: `onnxruntime` (CPU), not torch**, used machine has no
+  dedicated GPU. Added to `requirements.txt`.
+- [x] `pipeline/depth_ml.py` — `DepthEstimator` wraps the ONNX model
+  (preprocessing reimplemented by hand in `numpy`/`cv2` to match the
+  checkpoint's expected input, since no `transformers` dependency is pulled
+  in for this).
+- [x] `_demo()` in the same file (`python -m pipeline.depth_ml --video ...
+  --calibration ... --model ...`) is the sanity check that the model
+  actually runs: shows the source frame and colorized depth map side by
+  side on a recording, confirming inference works end-to-end rather than
+  just that the checkpoint loads. CPU inference is slow (~1.3s/frame), so
+  `--depth-stride` reuses the last depth map for N frames instead of
+  recomputing every frame.

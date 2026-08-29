@@ -12,3 +12,4 @@ __pycache__/
 
 # Model files
 *.onnx
+models/

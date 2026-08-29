@@ -230,10 +230,129 @@ def _validate_and_apply_ba(ba_result, keyframe_poses, sparse_map, recent_step_si
     return new_R, new_t
 
 
+def _run_depth_densify(frame_image, R_pos, t_pos, sparse_map, map_indices, image_points,
+                        pnp_inlier_mask, camera_matrix, depth_estimator, depth_rows, scan_stride):
+    """
+    Estimates ML depth for this keyframe, fits it (scale + shift) against
+    the confirmed map points PnP just matched (map_indices/image_points,
+    restricted to pnp_inlier_mask - the same trusted set the pose itself was
+    solved against), then back-projects a sample of scanline pixels into
+    world points using that fit.
+
+    Purely a visual sanity check for now (see NOTES.md's v2 plan) - the
+    caller must not feed the returned points into sparse_map/PnP/BA.
+
+    Returns (new_world_points, raw_depth, background_mask) - new_world_points
+    is empty if there wasn't enough data for a stable fit; raw_depth and
+    background_mask are always returned so the caller can still show them.
+    """
+    from pipeline.depth_ml import backproject_pixels, detect_background_mask, fit_disparity_scale_shift
+
+    raw_depth = depth_estimator.estimate(frame_image)
+
+    # a/(disp-b) is a reciprocal map (see below), so a small amount of the
+    # model's per-pixel disparity noise gets amplified nonlinearly once
+    # inverted - increasingly so at larger distances. A flat, receding
+    # surface (e.g. a half-open door) can come out visibly warped even
+    # though the underlying noise is roughly uniform across it. Median
+    # blur (edge-preserving, unlike Gaussian) suppresses that noise before
+    # it gets amplified, rather than cleaning up already-exploded Z values
+    # afterward - used for both the calibration fit and scanline sampling
+    # below so they stay in the same noise regime; the raw (unsmoothed)
+    # map is still what gets displayed/returned.
+    smoothed_depth = cv2.medianBlur(raw_depth.astype(np.float32), 5)
+
+    # Excludes new points from open floor/wall - a scanline crossing
+    # smoothly-receding floor produces a full-width strip of points every
+    # keyframe, which is pure repeated clutter (no object information)
+    # rather than useful densification. Deliberately a blacklist, not a
+    # whitelist: an earlier version tried to positively identify and only
+    # allow discrete objects, which ended up rejecting too many real ones -
+    # excluding just the (easier to identify reliably) background is more
+    # forgiving, since anything not confidently background still gets
+    # through. Only gates which pixels get turned into new points below -
+    # the calibration fit still uses every confirmed point regardless of
+    # surface. Runs on the camera image, not the depth map - see
+    # detect_background_mask.
+    background_mask = detect_background_mask(frame_image)
+
+    calib_pixels = image_points[pnp_inlier_mask]
+    calib_map_idx = map_indices[pnp_inlier_mask]
+    cam_pts = (R_pos @ sparse_map.points[calib_map_idx].T).T + t_pos.ravel()
+    inv_depth = 1.0 / cam_pts[:, 2]
+    us_i = np.clip(calib_pixels[:, 0].round().astype(int), 0, raw_depth.shape[1] - 1)
+    vs_i = np.clip(calib_pixels[:, 1].round().astype(int), 0, raw_depth.shape[0] - 1)
+    disparity = smoothed_depth[vs_i, us_i]
+
+    fit = fit_disparity_scale_shift(disparity, inv_depth)
+    if fit is None:
+        print(f"    [depth-densify: only {len(disparity)} confirmed points visible - "
+              f"skipping (need >= 10 for a stable fit)]")
+        return np.empty((0, 3)), raw_depth, background_mask
+
+    a, b = fit
+
+    # A degenerate fit (a close to 0 - the confirmed points barely span any
+    # disparity range, e.g. a near-planar/low-depth-variety calibration set)
+    # can still show a deceptively low RMSE in DISPARITY space while being
+    # useless in Z space, since a/(disp-b) amplifies whatever small disparity
+    # residual remains far more when a is small - a keyframe with a=2 gave a
+    # disparity RMSE of ~0.1 (looks fine) but reconstructed the calibration
+    # points' own known Z at 68 instead of their true ~1-50 range (garbage).
+    # Checking the reconstruction directly, in Z space, catches this - the
+    # same amplification that would corrupt new scanline points also shows
+    # up on the calibration points themselves when the fit is this unstable.
+    pred_z_calib = a / (disparity - b)
+    z_rel_error = np.median(np.abs(pred_z_calib - cam_pts[:, 2]) / cam_pts[:, 2])
+    if z_rel_error > 0.3:
+        print(f"    [depth-densify: fit unreliable (median Z reconstruction error "
+              f"{z_rel_error * 100:.0f}% on its own calibration points) - skipping]")
+        return np.empty((0, 3)), raw_depth, background_mask
+
+    # Same failure mode as triangulation's "sprinkler" artifact: z_cam =
+    # a/(disp-b) is a reciprocal map, so it's only well-conditioned close to
+    # the disparity range the fit was actually calibrated on - a small
+    # extrapolation in disparity becomes a huge one in Z once disp
+    # approaches b. Bounding z_cam by a multiplier on the calibration
+    # points' own Z range (tried first) still let extrapolated points
+    # through, since the reciprocal relationship means a "moderate" looking
+    # Z multiplier can correspond to a disparity far outside the fit's
+    # support. Restricting to the calibration set's own observed *disparity*
+    # range instead rejects extrapolation directly, at its actual source.
+    #
+    # The raw min/max of that range is itself fragile, though: a single
+    # confirmed point that's unusually far (or just noisy) sets the boundary
+    # right at the edge of the range - close to b - and every scanline pixel
+    # near that same edge still explodes even though it's nominally "in
+    # range" (this is what kept producing near-infinite points intermittently
+    # after the disparity-range clamp alone). Percentiles instead of min/max
+    # keep a handful of extreme calibration points from setting the boundary.
+    disp_lo, disp_hi = np.percentile(disparity, [5, 95])
+
+    new_points = []
+    for row in depth_rows:
+        us = np.arange(0, raw_depth.shape[1], scan_stride)
+        disp_row = smoothed_depth[row, us]
+        valid = (disp_row > disp_lo) & (disp_row < disp_hi) & ~background_mask[row, us]
+        if not np.any(valid):
+            continue
+        z_cam = a / (disp_row[valid] - b)
+        cam_xyz = backproject_pixels(us[valid], np.full(int(valid.sum()), row), z_cam, camera_matrix)
+        new_points.append((R_pos.T @ (cam_xyz.T - t_pos)).T)
+
+    new_points = np.vstack(new_points) if new_points else np.empty((0, 3))
+    pred_disp = a * inv_depth + b
+    rmse = float(np.sqrt(np.mean((pred_disp - disparity) ** 2)))
+    print(f"    [depth-densify: fit a={a:.3f} b={b:.3f} rmse={rmse:.3f} "
+          f"from {len(disparity)} confirmed points, {len(new_points)} ML points sampled]")
+    return new_points, raw_depth, background_mask
+
+
 def _demo():
     import argparse
 
     from capture.video_source import CalibratedVideoSource
+    from pipeline.depth_ml import DepthEstimator, colorize_depth_with_background, scanline_rows
     from pipeline.features import detect_and_compute_gridded, match_descriptors
     from pipeline.pose import (
         estimate_relative_pose, rotation_angle_deg, compose_pose,
@@ -299,7 +418,24 @@ def _demo():
     parser.add_argument("--plot-output", default="pipeline/data/map_trajectory.png")
     parser.add_argument("--no-display", action="store_true",
                          help="Disable the live matches+trajectory window")
+    parser.add_argument("--depth-densify", action="store_true",
+                         help="At each accepted keyframe, estimate ML depth and fit it "
+                              "(scale + shift) against the map's own confirmed points, "
+                              "then back-project scanline samples for visual "
+                              "sanity-checking. Not yet fed into pose estimation, PnP, "
+                              "or bundle adjustment - plotting only")
+    parser.add_argument("--model", help="Path to the depth model ONNX checkpoint "
+                                         "(required if --depth-densify is set)")
+    parser.add_argument("--depth-scan-rows", type=int, default=5,
+                         help="Number of horizontal scanlines sampled per keyframe for "
+                              "densification - horizontal only, since a vertical sweep "
+                              "collapses onto a single ray in the top-down map regardless "
+                              "of depth (see pipeline/depth_ml.py)")
+    parser.add_argument("--depth-scan-stride", type=int, default=4,
+                         help="Column stride when sampling each densification scanline")
     args = parser.parse_args()
+    if args.depth_densify and not args.model:
+        parser.error("--depth-densify requires --model")
 
     source = args.video
     if source.isdigit():
@@ -323,6 +459,14 @@ def _demo():
     recent_step_sizes = []
     n_keyframes = 0
     n_skipped = 0
+
+    # --depth-densify state: an ML depth model, run only at accepted keyframes
+    # (not every frame - keyframes are already sparse). ml_points is purely
+    # for visual sanity-checking (see below) - never fed into sparse_map.
+    depth_estimator = DepthEstimator(args.model) if args.depth_densify else None
+    ml_points = np.empty((0, 3), dtype=np.float64)
+    last_depth_vis = None
+    depth_rows = None
 
     with CalibratedVideoSource(source, args.calibration) as frames:
         K = frames.camera_matrix_undistorted
@@ -552,6 +696,21 @@ def _demo():
                                         ba_result, keyframe_poses, sparse_map,
                                         recent_step_sizes, R_pos, t_pos, args,
                                     )
+
+                                if args.depth_densify:
+                                    if depth_rows is None:
+                                        depth_rows = scanline_rows(
+                                            frame.image.shape[0], args.depth_scan_rows
+                                        )
+                                    new_ml_points, raw_depth, background_mask = _run_depth_densify(
+                                        frame.image, R_pos, t_pos, sparse_map,
+                                        map_indices, image_points, pnp_inlier_mask, K,
+                                        depth_estimator, depth_rows, args.depth_scan_stride,
+                                    )
+                                    if len(new_ml_points) > 0:
+                                        ml_points = np.vstack([ml_points, new_ml_points])
+                                    last_depth_vis = colorize_depth_with_background(raw_depth, background_mask)
+
                                 n_keyframes += 1
                                 is_keyframe = True
                                 status = f"TRACK ({pnp_inliers} inliers, {len(sparse_map)} map points)"
@@ -568,14 +727,37 @@ def _demo():
                     (0, 0, 255) if is_keyframe else (0, 200, 0), 2,
                 )
 
+                panels = [match_vis]
+                if args.depth_densify:
+                    # match_vis is drawMatches' side-by-side ref+current pair (double
+                    # width) - the depth panel is a single frame, so only its height
+                    # needs to line up for hstack, not its width.
+                    depth_panel = (
+                        last_depth_vis if last_depth_vis is not None
+                        else np.zeros((frame.image.shape[0], frame.image.shape[1], 3), dtype=np.uint8)
+                    )
+                    if depth_panel.shape[0] != match_vis.shape[0]:
+                        scale = match_vis.shape[0] / depth_panel.shape[0]
+                        depth_panel = cv2.resize(depth_panel, None, fx=scale, fy=scale)
+                    panels.append(depth_panel)
+
                 positions = [camera_center(R, t) for R, t in keyframe_poses]
-                traj_vis = render_trajectory(
-                    positions,
-                    sparse_map.points[sparse_map.confirmed],
-                    sparse_map.points[~sparse_map.confirmed],
-                    size=match_vis.shape[0],
-                )
-                combined = np.hstack([match_vis, traj_vis])
+                if args.depth_densify:
+                    # Cleaner plot when densifying: just the trajectory and
+                    # the ML depth points it's meant to be compared against,
+                    # not also the ORB map that's already shown implicitly
+                    # (via which pixels contribute to ml_points) - showing
+                    # both clutters the exact thing being visually checked.
+                    traj_vis = render_trajectory(positions, ml_points=ml_points, size=match_vis.shape[0])
+                else:
+                    traj_vis = render_trajectory(
+                        positions,
+                        sparse_map.points[sparse_map.confirmed],
+                        sparse_map.points[~sparse_map.confirmed],
+                        size=match_vis.shape[0],
+                    )
+                panels.append(traj_vis)
+                combined = np.hstack(panels)
 
                 # The raw combined image (two video frames + a square map panel
                 # sized to match their height) is often wider/taller than a
@@ -590,7 +772,12 @@ def _demo():
                         interpolation=cv2.INTER_AREA,
                     )
 
-                cv2.imshow("SLAM v1 - map tracking (bootstrap + PnP)", combined)
+                window_title = (
+                    "SLAM v1+v2 - map tracking + ML depth densify (bootstrap + PnP)"
+                    if args.depth_densify else
+                    "SLAM v1 - map tracking (bootstrap + PnP)"
+                )
+                cv2.imshow(window_title, combined)
                 if cv2.waitKey(delay_ms) & 0xFF == ord("q"):
                     break
 
@@ -605,6 +792,9 @@ def _demo():
     print(f"\n{n_keyframes} keyframes accepted "
           f"({sparse_map.n_confirmed} confirmed / {len(sparse_map)} total map points), "
           f"{n_skipped} frames skipped")
+    if args.depth_densify:
+        print(f"{len(ml_points)} ML-depth points sampled (sanity-check plot only - "
+              f"not part of the tracked map)")
 
     positions = np.array(
         [camera_center(R, t) for R, t in keyframe_poses]
@@ -618,7 +808,13 @@ def _demo():
     import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(figsize=(8, 8))
-    if len(sparse_map) > 0:
+    if args.depth_densify:
+        # Same reasoning as the live view: just trajectory + ML points for a
+        # clean comparison, not also the ORB map cluttering the same plot.
+        if len(ml_points) > 0:
+            ax.scatter(ml_points[:, 0], ml_points[:, 2],
+                       c="lightblue", s=2, label="ML depth (unverified)", zorder=0)
+    elif len(sparse_map) > 0:
         confirmed_pts = sparse_map.points[sparse_map.confirmed]
         provisional_pts = sparse_map.points[~sparse_map.confirmed]
         if len(provisional_pts) > 0:
