@@ -608,3 +608,111 @@ What's left is refinement and deferred items, not missing core functionality:
   just that the checkpoint loads. CPU inference is slow (~1.3s/frame), so
   `--depth-stride` reuses the last depth map for N frames instead of
   recomputing every frame.
+
+## Ground-truth evaluation (TUM RGB-D)
+
+Up to this point, "does it track well" was judged qualitatively (eyeball the
+`--plot-output` PNG, watch the PnP inlier ratio). To get an actual number,
+the pipeline can now be pointed at a public SLAM benchmark that ships
+real ground-truth camera poses: [TUM RGB-D](https://cvg.cit.tum.de/data/datasets/rgbd-dataset)
+(Technical University of Munich's Computer Vision Group).
+
+- [x] **New frame source**: `capture.video_source.CalibratedImageSequenceSource`
+  reads a TUM-style image-sequence folder (`rgb.txt` + PNGs) through the same
+  `Frame(index, timestamp, image)` iterator interface as
+  `CalibratedVideoSource`, sharing its undistort/crop logic (factored out
+  into module-level `_load_calibration`/`_build_undistort_params`/
+  `_undistort_and_crop` helpers rather than duplicated). A new
+  `open_calibrated_source(source, calibration_path)` dispatches on
+  `os.path.isdir(source)` to pick the right class; `mapping.py --video` now
+  accepts a folder path as an alternative to a video file through this.
+- [x] **Timestamps threaded through `keyframe_poses`**: entries are now
+  `(R, t, timestamp)` instead of `(R, t)`, sourced from `frame.timestamp` at
+  the point each keyframe is accepted (including the initial bootstrap
+  reference frame). This is what lets `--trajectory-output` write real
+  per-keyframe timestamps rather than a synthetic frame index.
+- [x] **`--trajectory-output PATH`**: writes each accepted keyframe's pose as
+  one TUM-format line (`timestamp tx ty tz qx qy qz qw`). The pipeline's own
+  `(R, t)` is world-to-camera (`X_cam = R @ X_world + t`); TUM expects camera
+  position + orientation *in the world frame* - the inverse. Position reuses
+  `pose.camera_center` (`-R.T @ t`, the same inversion already used for
+  plotting); orientation is `R.T` converted to a quaternion via
+  `scipy.spatial.transform.Rotation.from_matrix(R.T).as_quat()`, which
+  already returns `(qx, qy, qz, qw)` - TUM's column order, no reordering
+  needed. Verified against the trivial case (identity pose → position
+  `(0,0,0)`, quaternion `(0,0,0,1)`) and against the standard pinhole
+  convention (a camera translated to world `(0,0,5)` with no rotation puts a
+  world point at `(0,0,10)` at camera-frame `Z=5`, i.e. "5 in front" - not
+  behind or mirrored) before trusting the ATE/RPE numbers below.
+
+**Dataset used:** `rgbd_dataset_freiburg1_xyz` - the TUM download page's own
+recommended starting sequence ("motion is relatively small and only a small
+volume on an office desk is covered"), comparable in difficulty to this
+project's own early demo recordings. 798 RGB frames, 640x480.
+
+```bash
+curl -LO https://cvg.cit.tum.de/rgbd/dataset/freiburg1/rgbd_dataset_freiburg1_xyz.tgz
+# extract to datasets/tum/rgbd_dataset_freiburg1_xyz/  (gitignored - see .gitignore's `datasets/` entry)
+```
+
+**Calibration:** `calibration/tum_freiburg1.yaml`, the published `freiburg1`
+camera intrinsics from the TUM download page, in the same schema as
+`calibration/phone_camera.yaml` (`image_width`, `image_height`,
+`camera_matrix`, `dist_coeffs`). Kept tracked in git, unlike the dataset
+itself.
+
+**Command line run:**
+
+```bash
+python -m pipeline.mapping \
+  --video datasets/tum/rgbd_dataset_freiburg1_xyz \
+  --calibration calibration/tum_freiburg1.yaml \
+  --trajectory-output estimate.txt \
+  --no-display
+```
+
+Result: 355 keyframes accepted (18644 confirmed / 26406 total map points),
+442 frames skipped - runs end-to-end exactly like a `recordings/*.mp4` file.
+
+**Regression check:** re-ran `recordings/demo1.mp4` (existing `--video <file>`
+path) before and after this change with `--no-display` - identical final
+summary line (`44 keyframes accepted (3522 confirmed / 7315 total map
+points), 793 frames skipped`) and byte-identical `--plot-output` PNG.
+
+**Scoring with `evo`** (`pip install evo`):
+
+```bash
+evo_ape tum datasets/tum/rgbd_dataset_freiburg1_xyz/groundtruth.txt estimate.txt -a -s
+evo_rpe tum datasets/tum/rgbd_dataset_freiburg1_xyz/groundtruth.txt estimate.txt -a -s
+```
+
+`-a -s` matters, not just `-a`: `-a` alone is a rigid SE(3) (no-scale)
+alignment, which reports a huge, meaningless error for a monocular pipeline
+whose scale is fixed once at bootstrap and isn't metric (see
+`V2_INTEGRATION_PLAN.md` Section 2b) - confirmed empirically, `-a` alone gave
+an ATE RMSE of 4.19m on this sequence. Adding `-s` (Sim(3) Umeyama alignment,
+solving for one global scale factor too) is the correct comparison and gives:
+
+```
+APE (ATE), translation, Sim(3)-aligned:
+  rmse    0.079640
+  mean    0.062792
+  median  0.043739
+  max     0.230436
+  min     0.009902
+
+RPE (delta=1 frame), translation, Sim(3)-aligned:
+  rmse    0.040234
+  mean    0.028280
+  median  0.018679
+  max     0.175478
+  min     0.002387
+```
+
+ATE RMSE ~8cm, RPE RMSE ~4cm on a sequence with meter-scale motion - a
+working, reproducible measurement (per this issue's acceptance criteria, not
+claimed to be a *good* score, though it's a reasonable result for a v1
+monocular pipeline with no loop closure on a short, low-drift sequence).
+`groundtruth.txt`'s ~3000 entries (mocap rate) vs. `rgb.txt`'s 798 (camera
+rate) needed no manual handling - `evo`'s tools associate estimate/ground-truth
+timestamps automatically.
