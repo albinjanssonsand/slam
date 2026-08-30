@@ -13,3 +13,7 @@ __pycache__/
 # Model files
 *.onnx
 models/
+
+# Downloaded benchmark datasets (e.g. TUM RGB-D) - large, publicly
+# re-downloadable, not project source
+datasets/
