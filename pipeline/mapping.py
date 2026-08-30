@@ -181,7 +181,8 @@ def _run_local_ba(keyframe_poses, keyframe_observations, sparse_map, camera_matr
 def _apply_ba_result(keyframe_poses, sparse_map, ba_result):
     start, refined_rot, refined_trans, point_ids, refined_pts = ba_result
     for i, (R_ref, t_ref) in enumerate(zip(refined_rot, refined_trans)):
-        keyframe_poses[start + i] = (R_ref, t_ref)
+        _, _, timestamp = keyframe_poses[start + i]
+        keyframe_poses[start + i] = (R_ref, t_ref, timestamp)
     sparse_map.points[point_ids] = refined_pts
 
 
@@ -210,7 +211,7 @@ def _validate_and_apply_ba(ba_result, keyframe_poses, sparse_map, recent_step_si
     start, refined_rot, refined_trans, _, _ = ba_result
 
     for i, (new_R, new_t) in enumerate(zip(refined_rot, refined_trans)):
-        old_R, old_t = keyframe_poses[start + i]
+        old_R, old_t, _ = keyframe_poses[start + i]
         rot_change = rotation_angle_deg(new_R @ old_R.T)
         step_change = np.linalg.norm(
             camera_center(new_R, new_t) - camera_center(old_R, old_t)
@@ -348,10 +349,45 @@ def _run_depth_densify(frame_image, R_pos, t_pos, sparse_map, map_indices, image
     return new_points, raw_depth, background_mask
 
 
+def _write_tum_trajectory(path, keyframe_poses):
+    """
+    Writes each keyframe's pose as one TUM-format line: "timestamp tx ty tz
+    qx qy qz qw" - the format TUM's own tools and evo (evo_ape/evo_rpe)
+    expect for both ground truth and estimated trajectories.
+
+    keyframe_poses entries are (R, t, timestamp) in this pipeline's
+    world-to-camera convention (X_cam = R @ X_world + t; see pose.py).
+    TUM expects the inverse: camera position and orientation *in the world
+    frame*. Position reuses pose.camera_center (-R.T @ t), the same
+    inversion already used for plotting; orientation is R.T (rotation from
+    camera frame to world frame), converted to a quaternion via
+    scipy - Rotation.as_quat() returns (x, y, z, w), which is already TUM's
+    column order.
+    """
+    import os
+
+    from scipy.spatial.transform import Rotation
+
+    from pipeline.pose import camera_center
+
+    out_dir = os.path.dirname(path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    with open(path, "w") as f:
+        for R, t, timestamp in keyframe_poses:
+            position = camera_center(R, t).ravel()
+            qx, qy, qz, qw = Rotation.from_matrix(R.T).as_quat()
+            f.write(
+                f"{timestamp:.6f} {position[0]:.6f} {position[1]:.6f} {position[2]:.6f} "
+                f"{qx:.6f} {qy:.6f} {qz:.6f} {qw:.6f}\n"
+            )
+
+
 def _demo():
     import argparse
 
-    from capture.video_source import CalibratedVideoSource
+    from capture.video_source import open_calibrated_source
     from pipeline.depth_ml import DepthEstimator, colorize_depth_with_background, scanline_rows
     from pipeline.features import detect_and_compute_gridded, match_descriptors
     from pipeline.pose import (
@@ -363,7 +399,9 @@ def _demo():
     parser = argparse.ArgumentParser(
         description="Bootstrap a sparse map once, then track keyframes against it via PnP"
     )
-    parser.add_argument("--video", required=True, help="Video file path or integer device index")
+    parser.add_argument("--video", required=True,
+                         help="Video file path, integer device index, or image-sequence folder "
+                              "(e.g. a TUM RGB-D sequence, containing rgb.txt)")
     parser.add_argument("--calibration", required=True, help="Path to calibration YAML")
     parser.add_argument("--n-features", type=int, default=5000)
     parser.add_argument("--grid", default="4x4",
@@ -416,6 +454,10 @@ def _demo():
     parser.add_argument("--no-ba", action="store_true",
                          help="Disable local bundle adjustment (for comparison)")
     parser.add_argument("--plot-output", default="pipeline/data/map_trajectory.png")
+    parser.add_argument("--trajectory-output",
+                         help="Write each accepted keyframe's pose to this path in TUM format "
+                              "(\"timestamp tx ty tz qx qy qz qw\", one line per keyframe) for "
+                              "scoring against ground truth (e.g. with evo_ape/evo_rpe)")
     parser.add_argument("--no-display", action="store_true",
                          help="Disable the live matches+trajectory window")
     parser.add_argument("--depth-densify", action="store_true",
@@ -437,10 +479,6 @@ def _demo():
     if args.depth_densify and not args.model:
         parser.error("--depth-densify requires --model")
 
-    source = args.video
-    if source.isdigit():
-        source = int(source)
-
     grid_rows, grid_cols = (int(v) for v in args.grid.lower().split("x"))
     sparse_map = Map(required_confirmations=args.confirm_count)
 
@@ -448,9 +486,14 @@ def _demo():
     t_pos = np.zeros((3, 1))
 
     # keyframe_poses[i] / keyframe_observations[i] describe the i-th accepted
-    # keyframe: its world-to-camera pose, and the (map_point_idx, x, y) pixel
-    # observations made in it - the raw material local bundle adjustment refines.
-    keyframe_poses = [(R_pos, t_pos)]
+    # keyframe: its world-to-camera pose, its source frame's timestamp, and
+    # the (map_point_idx, x, y) pixel observations made in it - the raw
+    # material local bundle adjustment (and --trajectory-output) use. The
+    # timestamp defaults to 0.0 (not read yet) and is overwritten with the
+    # real first-frame timestamp below; a source that opens but never
+    # yields a frame (e.g. a truncated video) leaves it at this default
+    # rather than None, so --trajectory-output can't crash formatting it.
+    keyframe_poses = [(R_pos, t_pos, 0.0)]
     keyframe_observations = [[]]
 
     ref_kp = None
@@ -468,9 +511,9 @@ def _demo():
     last_depth_vis = None
     depth_rows = None
 
-    with CalibratedVideoSource(source, args.calibration) as frames:
+    with open_calibrated_source(args.video, args.calibration) as frames:
         K = frames.camera_matrix_undistorted
-        fps = frames.cap.get(cv2.CAP_PROP_FPS) or 30.0
+        fps = frames.fps
         delay_ms = max(1, int(1000 / fps))
 
         for frame in frames:
@@ -480,6 +523,7 @@ def _demo():
 
             if ref_desc is None:
                 ref_kp, ref_desc, ref_image = kp, desc, frame.image
+                keyframe_poses[0] = (R_pos, t_pos, frame.timestamp)
                 continue
 
             matches_ref = match_descriptors(ref_desc, desc, args.ratio)
@@ -543,7 +587,7 @@ def _demo():
                             )
 
                             R_pos, t_pos = R_new, t_new
-                            keyframe_poses.append((R_pos, t_pos))
+                            keyframe_poses.append((R_pos, t_pos, frame.timestamp))
                             if not args.no_ba and len(keyframe_poses) % args.ba_every == 0:
                                 ba_result = _run_local_ba(keyframe_poses, keyframe_observations,
                                                            sparse_map, K, args.ba_window,
@@ -686,7 +730,7 @@ def _demo():
                                 del recent_step_sizes[:-20]
 
                                 R_pos, t_pos = R_new, t_new
-                                keyframe_poses.append((R_pos, t_pos))
+                                keyframe_poses.append((R_pos, t_pos, frame.timestamp))
                                 keyframe_observations.append(this_kf_observations)
                                 if not args.no_ba and len(keyframe_poses) % args.ba_every == 0:
                                     ba_result = _run_local_ba(keyframe_poses, keyframe_observations,
@@ -741,7 +785,7 @@ def _demo():
                         depth_panel = cv2.resize(depth_panel, None, fx=scale, fy=scale)
                     panels.append(depth_panel)
 
-                positions = [camera_center(R, t) for R, t in keyframe_poses]
+                positions = [camera_center(R, t) for R, t, _ in keyframe_poses]
                 if args.depth_densify:
                     # Cleaner plot when densifying: just the trajectory and
                     # the ML depth points it's meant to be compared against,
@@ -797,11 +841,16 @@ def _demo():
               f"not part of the tracked map)")
 
     positions = np.array(
-        [camera_center(R, t) for R, t in keyframe_poses]
+        [camera_center(R, t) for R, t, _ in keyframe_poses]
     ).reshape(-1, 3)
 
     import os
     os.makedirs(os.path.dirname(args.plot_output), exist_ok=True)
+
+    if args.trajectory_output:
+        _write_tum_trajectory(args.trajectory_output, keyframe_poses)
+        print(f"Saved TUM-format trajectory ({len(keyframe_poses)} keyframes) to "
+              f"{args.trajectory_output}")
 
     import matplotlib
     matplotlib.use("Agg")
