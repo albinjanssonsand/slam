@@ -346,12 +346,14 @@ def _demo():
     import argparse
     import time
 
-    from capture.video_source import CalibratedVideoSource
+    from capture.video_source import open_calibrated_source
 
     parser = argparse.ArgumentParser(
         description="Show live ML monocular depth estimation side by side with the source video"
     )
-    parser.add_argument("--video", required=True, help="Video file path or integer device index")
+    parser.add_argument("--video", required=True,
+                         help="Video file path, integer device index, or image-sequence folder "
+                              "(e.g. a TUM RGB-D sequence, containing rgb.txt)")
     parser.add_argument("--calibration", required=True, help="Path to calibration YAML")
     parser.add_argument("--model", required=True, help="Path to the depth model ONNX checkpoint")
     parser.add_argument("--depth-stride", type=int, default=20,
@@ -368,18 +370,14 @@ def _demo():
                          help="Disable the live source+depth window")
     args = parser.parse_args()
 
-    source = args.video
-    if source.isdigit():
-        source = int(source)
-
     estimator = DepthEstimator(args.model)
     last_depth = None
     rows_xz = []
     n_updates = 0
 
-    with CalibratedVideoSource(source, args.calibration) as frames:
+    with open_calibrated_source(args.video, args.calibration) as frames:
         K = frames.camera_matrix_undistorted
-        fps = frames.cap.get(cv2.CAP_PROP_FPS) or 30.0
+        fps = frames.fps
         delay_ms = max(1, int(1000 / fps))
         rows = None
 

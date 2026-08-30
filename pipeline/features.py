@@ -106,18 +106,16 @@ def match_descriptors(desc1, desc2, ratio=0.75):
 def _demo():
     import argparse
 
-    from capture.video_source import CalibratedVideoSource
+    from capture.video_source import open_calibrated_source
 
     parser = argparse.ArgumentParser(description="Visualize ORB matches between consecutive frames")
-    parser.add_argument("--video", required=True, help="Video file path or integer device index")
+    parser.add_argument("--video", required=True,
+                         help="Video file path, integer device index, or image-sequence folder "
+                              "(e.g. a TUM RGB-D sequence, containing rgb.txt)")
     parser.add_argument("--calibration", required=True, help="Path to calibration YAML")
     parser.add_argument("--n-features", type=int, default=2000)
     parser.add_argument("--ratio", type=float, default=0.75, help="Lowe's ratio test threshold")
     args = parser.parse_args()
-
-    source = args.video
-    if source.isdigit():
-        source = int(source)
 
     orb = create_orb(args.n_features)
 
@@ -125,8 +123,8 @@ def _demo():
     prev_kp = None
     prev_desc = None
 
-    with CalibratedVideoSource(source, args.calibration) as frames:
-        fps = frames.cap.get(cv2.CAP_PROP_FPS) or 30.0
+    with open_calibrated_source(args.video, args.calibration) as frames:
+        fps = frames.fps
         delay_ms = max(1, int(1000 / fps))
 
         for frame in frames:

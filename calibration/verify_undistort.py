@@ -6,7 +6,7 @@ for warping artifacts (a sign of an overfit distortion model, e.g. a large k3)
 especially near the edges/corners of the frame.
 
 Usage:
-    python calibration/verify_undistort.py --video calibration/data/checkerboard.mp4 \
+    python -m calibration.verify_undistort --video calibration/data/checkerboard.mp4 \
         --calibration calibration/phone_camera.yaml --frame 100 \
         --output calibration/data/undistort_check.png
 """
@@ -15,16 +15,8 @@ import argparse
 
 import cv2
 import numpy as np
-import yaml
 
-
-def load_calibration(path):
-    with open(path, "r") as f:
-        data = yaml.safe_load(f)
-    camera_matrix = np.array(data["camera_matrix"], dtype=np.float64)
-    dist_coeffs = np.array(data["dist_coeffs"], dtype=np.float64)
-    image_size = (data["image_width"], data["image_height"])
-    return camera_matrix, dist_coeffs, image_size
+from capture.video_source import load_calibration
 
 
 def read_frame(video_path, frame_index):
