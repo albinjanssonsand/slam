@@ -440,7 +440,7 @@ def _demo():
                               "refines (keeps the most recently added ones if exceeded)")
     parser.add_argument("--no-ba", action="store_true",
                          help="Disable local bundle adjustment (for comparison)")
-    parser.add_argument("--plot-output", default="pipeline/data/map_trajectory.png")
+    parser.add_argument("--plot-output", default="results/map_trajectory.png")
     parser.add_argument("--trajectory-output",
                          help="Write each accepted keyframe's pose to this path in TUM format "
                               "(\"timestamp tx ty tz qx qy qz qw\", one line per keyframe) for "

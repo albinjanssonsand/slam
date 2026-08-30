@@ -8,9 +8,9 @@ alignment `evo_ape ... -a -s` performs for scoring (see NOTES.md).
 
 Usage:
     python scripts/plot_trajectory.py \
-        --estimate estimate.txt \
+        --estimate results/estimate.txt \
         --groundtruth datasets/tum/rgbd_dataset_freiburg1_xyz/groundtruth.txt \
-        --output trajectory.png
+        --output results/trajectory.png
 """
 
 import argparse
@@ -77,12 +77,12 @@ def umeyama_alignment(src, dst):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--estimate", default="estimate.txt")
+    parser.add_argument("--estimate", default="results/estimate.txt")
     parser.add_argument(
         "--groundtruth",
         default="datasets/tum/rgbd_dataset_freiburg1_xyz/groundtruth.txt",
     )
-    parser.add_argument("--output", default="trajectory.png")
+    parser.add_argument("--output", default="results/trajectory.png")
     parser.add_argument("--max-diff", type=float, default=0.02,
                          help="max timestamp gap (s) for association")
     args = parser.parse_args()
