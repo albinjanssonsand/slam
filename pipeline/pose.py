@@ -151,14 +151,16 @@ def render_trajectory(positions, map_points=None, provisional_points=None, ml_po
 def _demo():
     import argparse
 
-    from capture.video_source import CalibratedVideoSource
+    from capture.video_source import open_calibrated_source
     from pipeline.features import create_orb, detect_and_compute, match_descriptors
     from pipeline.triangulation import triangulate
 
     parser = argparse.ArgumentParser(
         description="Chain keyframe-to-keyframe poses across a video and plot the trajectory"
     )
-    parser.add_argument("--video", required=True, help="Video file path or integer device index")
+    parser.add_argument("--video", required=True,
+                         help="Video file path, integer device index, or image-sequence folder "
+                              "(e.g. a TUM RGB-D sequence, containing rgb.txt)")
     parser.add_argument("--calibration", required=True, help="Path to calibration YAML")
     parser.add_argument("--n-features", type=int, default=2000)
     parser.add_argument("--ratio", type=float, default=0.75, help="Lowe's ratio test threshold")
@@ -176,10 +178,6 @@ def _demo():
                          help="Disable the live matches+trajectory window")
     args = parser.parse_args()
 
-    source = args.video
-    if source.isdigit():
-        source = int(source)
-
     orb = create_orb(args.n_features)
 
     R_pos = np.eye(3)
@@ -193,9 +191,9 @@ def _demo():
     n_keyframes = 0
     n_skipped = 0
 
-    with CalibratedVideoSource(source, args.calibration) as frames:
+    with open_calibrated_source(args.video, args.calibration) as frames:
         K = frames.camera_matrix_undistorted
-        fps = frames.cap.get(cv2.CAP_PROP_FPS) or 30.0
+        fps = frames.fps
         delay_ms = max(1, int(1000 / fps))
 
         for frame in frames:
