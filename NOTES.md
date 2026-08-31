@@ -716,3 +716,47 @@ monocular pipeline with no loop closure on a short, low-drift sequence).
 `groundtruth.txt`'s ~3000 entries (mocap rate) vs. `rgb.txt`'s 798 (camera
 rate) needed no manual handling - `evo`'s tools associate estimate/ground-truth
 timestamps automatically.
+
+## ML-vs-geometric trajectory comparison (v2 Phase 0)
+
+`scripts/compare_trajectories.py` generalizes `plot_trajectory.py` to two
+estimates at once (reusing its `load_tum`/`associate`/`umeyama_alignment`
+helpers rather than duplicating them): each estimate is independently
+Umeyama-aligned (Sim(3): rotation + scale + translation) onto ground truth,
+both aligned trajectories are plotted overlaid on one figure, and ATE
+(translation RMSE over the timestamp-matched, aligned pairs) is printed for
+each. ATE is computed directly in Python - not by shelling out to `evo_ape` -
+since `evo` isn't a hard dependency of this repo; verified to match
+`evo_ape -a -s`'s `rmse` exactly (0.073161 on `fr1_xyz_estimate.txt`) before
+trusting the number.
+
+**Smoke test** (same file passed as both estimates, so both ATE numbers
+must match exactly):
+
+```bash
+python scripts/compare_trajectories.py \
+  --estimate-a results/fr1_xyz_estimate.txt \
+  --estimate-b results/fr1_xyz_estimate.txt \
+  --groundtruth datasets/tum/rgbd_dataset_freiburg1_xyz/groundtruth.txt \
+  --output results/compare_smoketest.png
+```
+
+```
+ATE (translation RMSE), Sim(3)-aligned:
+  geometric-only: 0.073161
+  + ML depth: 0.073161
+```
+
+**Real baseline-vs-ML-fusion comparison (TBD once Phase 2 lands):** once
+`--depth-fuse` (v2 Phase 1, see `V2_INTEGRATION_PLAN.md`) exists, run
+`pipeline.mapping` once with it off and once with it on, each with its own
+`--trajectory-output`, then:
+
+```bash
+python scripts/compare_trajectories.py \
+  --estimate-a results/geometric_estimate.txt \
+  --estimate-b results/ml_fusion_estimate.txt \
+  --label-a "geometric-only" --label-b "+ ML depth" \
+  --groundtruth datasets/tum/rgbd_dataset_freiburg1_xyz/groundtruth.txt \
+  --output results/compare_ml_fusion.png
+```
