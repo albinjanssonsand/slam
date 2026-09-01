@@ -64,6 +64,18 @@ def camera_center(R_pos, t_pos):
     return -R_pos.T @ t_pos
 
 
+def predict_constant_velocity(R_prev, t_prev, R_cur, t_cur):
+    """
+    Predict the next pose assuming the camera continues its most recent
+    relative motion unchanged (constant-velocity model): the world-to-camera
+    transform observed going from R_prev/t_prev to R_cur/t_cur is assumed to
+    repeat identically going from R_cur/t_cur to the predicted pose.
+    """
+    R_rel = R_cur @ R_prev.T
+    t_rel = t_cur - R_rel @ t_prev
+    return compose_pose(R_cur, t_cur, R_rel, t_rel)
+
+
 def median_parallax(pts1, pts2):
     """Median pixel displacement between two matched point sets - a cheap proxy
     for how much camera baseline has accumulated between two frames."""
