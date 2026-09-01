@@ -1,6 +1,9 @@
 """
 Persistent sparse map: bootstrap once via two-view triangulation, then track
-every subsequent keyframe against the existing map via PnP.
+pose against the existing map via PnP on every subsequent frame (motion-
+predicted guided matching, see Map.match_against_guided), inserting a
+keyframe - and extending the map - only once parallax has accumulated far
+enough since the last one.
 
 This replaces independent keyframe-to-keyframe two-view pose chaining (which
 compounds scale drift, since cv2.recoverPose always returns a unit-length
@@ -17,6 +20,18 @@ import cv2
 import numpy as np
 
 from pipeline.pose import camera_center
+
+# Precomputed bit-count per byte value, so Hamming distance between ORB
+# descriptors (32 packed bytes each) can be computed as a vectorized
+# XOR + table lookup instead of a per-descriptor cv2.norm call - needed to
+# keep match_against_guided's per-map-point candidate scoring cheap.
+_POPCOUNT_TABLE = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint8)
+
+
+def _hamming_distances(query_desc, candidate_descs):
+    """Hamming distance from one descriptor to each row of candidate_descs."""
+    xor = np.bitwise_xor(candidate_descs, query_desc)
+    return _POPCOUNT_TABLE[xor].sum(axis=1, dtype=np.int32)
 
 
 class KeyframePose(NamedTuple):
@@ -96,6 +111,54 @@ class Map:
         map_indices = subset[[m.queryIdx for m in matches]]
         frame_indices = np.array([m.trainIdx for m in matches], dtype=int)
         return map_indices, frame_indices
+
+    def match_against_guided(self, kp, desc, camera_matrix, R_pred, t_pred,
+                              window=25.0, ratio=0.75, mask=None):
+        """
+        Guided variant of match_against: project each map point (subset) into
+        the frame using a predicted pose, and only consider frame keypoints
+        within `window` pixels of that projection as candidates for its
+        descriptor match, instead of searching every keypoint in the frame.
+        This both narrows ambiguity (fewer, geometrically-plausible
+        candidates per point) and is cheaper than a full brute-force pass,
+        since a cKDTree radius query replaces an all-pairs search.
+
+        Points that predict behind the camera, or outside `window` of every
+        keypoint, contribute no match. Returns (map_indices, frame_indices),
+        same convention as match_against.
+        """
+        from scipy.spatial import cKDTree
+
+        subset = np.where(mask)[0] if mask is not None else np.arange(len(self))
+        if len(subset) == 0 or desc is None or len(desc) == 0 or len(kp) == 0:
+            return np.empty(0, dtype=int), np.empty(0, dtype=int)
+
+        rvec_pred, _ = cv2.Rodrigues(R_pred)
+        proj, _ = cv2.projectPoints(self.points[subset], rvec_pred, t_pred, camera_matrix, None)
+        proj = proj.reshape(-1, 2)
+
+        cam_pts = (R_pred @ self.points[subset].T).T + t_pred.ravel()
+        in_front = cam_pts[:, 2] > 0
+
+        frame_pts = np.float32([k.pt for k in kp])
+        tree = cKDTree(frame_pts)
+        neighbor_lists = tree.query_ball_point(proj, r=window)
+
+        map_indices = []
+        frame_indices = []
+        for local_i, neighbors in enumerate(neighbor_lists):
+            if not in_front[local_i] or not neighbors:
+                continue
+            cand = np.array(neighbors)
+            cand_desc = desc[cand]
+            dists = _hamming_distances(self.descriptors[subset[local_i]], cand_desc)
+            order = np.argsort(dists)
+            if len(order) >= 2 and dists[order[0]] >= ratio * dists[order[1]]:
+                continue
+            map_indices.append(subset[local_i])
+            frame_indices.append(int(cand[order[0]]))
+
+        return np.array(map_indices, dtype=int), np.array(frame_indices, dtype=int)
 
 
 def estimate_pose_pnp(object_points, image_points, camera_matrix):
@@ -378,13 +441,15 @@ def _demo():
     from pipeline.features import detect_and_compute_gridded, match_descriptors
     from pipeline.pose import (
         estimate_relative_pose, rotation_angle_deg, compose_pose,
-        median_parallax, render_trajectory,
+        median_parallax, predict_constant_velocity, render_trajectory,
     )
     from pipeline.trajectory import write_tum_trajectory
     from pipeline.triangulation import triangulate
 
     parser = argparse.ArgumentParser(
-        description="Bootstrap a sparse map once, then track keyframes against it via PnP"
+        description="Bootstrap a sparse map once, then track pose every frame via "
+                     "motion-predicted guided PnP against it, inserting a keyframe "
+                     "(triangulation/confirmation/BA) only once parallax accumulates"
     )
     parser.add_argument("--video", required=True,
                          help="Video file path, integer device index, or image-sequence folder "
@@ -398,15 +463,24 @@ def _demo():
     parser.add_argument("--ratio", type=float, default=0.75, help="Lowe's ratio test threshold")
     parser.add_argument("--min-parallax", type=float, default=10.0,
                          help="Minimum median pixel displacement vs the reference keyframe "
-                              "before attempting pose estimation (px)")
+                              "before this frame's tracked pose is also inserted as a new "
+                              "keyframe (triangulation/confirmation/BA) - does not gate "
+                              "whether a pose is estimated at all; every frame attempts "
+                              "motion-predicted guided PnP against the map (px)")
+    parser.add_argument("--guided-window", type=float, default=60.0,
+                         help="Pixel radius around each confirmed map point's motion-"
+                              "predicted projection to search for a descriptor match "
+                              "during per-frame PnP tracking, replacing an unguided "
+                              "full-frame search (see Map.match_against_guided)")
     parser.add_argument("--min-inliers", type=int, default=60,
                          help="Minimum bootstrap (essential matrix) pose inliers to accept a keyframe")
     parser.add_argument("--pnp-min-inliers", type=int, default=20,
-                         help="Minimum PnP inliers required to accept a tracked keyframe")
+                         help="Minimum PnP inliers required to accept a tracked frame's pose "
+                              "(checked every frame, not just when it becomes a keyframe)")
     parser.add_argument("--max-plausible-rotation", type=float, default=15.0,
                          help="Reject a PnP pose if the relative rotation vs. the previous "
-                              "keyframe exceeds this (deg) - real handheld motion between two "
-                              "close keyframes shouldn't produce tens of degrees of rotation; "
+                              "tracked frame exceeds this (deg) - real handheld motion between "
+                              "two close frames shouldn't produce tens of degrees of rotation; "
                               "a jump this large usually means PnP locked onto a degenerate/"
                               "ambiguous alternate solution (common with poorly depth-"
                               "distributed points) rather than that real rotation occurred")
@@ -422,8 +496,9 @@ def _demo():
                               "needs before being promoted to confirmed/trusted")
     parser.add_argument("--max-step-ratio", type=float, default=6.0,
                          help="Reject a PnP pose if the camera-center displacement vs. the "
-                              "previous keyframe exceeds this many multiples of the recent "
-                              "median step size. Companion check to --max-plausible-rotation: "
+                              "previous tracked frame exceeds this many multiples of the "
+                              "recent median step size. Companion check to "
+                              "--max-plausible-rotation: "
                               "a degenerate/ambiguous PnP solution doesn't always show up as "
                               "a rotation flip - it can instead keep a plausible rotation but "
                               "put the camera in the wrong place, which the rotation check "
@@ -486,8 +561,27 @@ def _demo():
     ref_kp = None
     ref_desc = None
     ref_image = None
+    ref_R = None  # pose of the current reference keyframe (ref_kp/ref_desc's source) -
+    ref_t = None  # distinct from R_pos/t_pos, which now updates every tracked frame
     recent_step_sizes = []
+    # prev_pose/cur_pose_frame track the two most recent accepted per-frame
+    # poses (bootstrap counts as the first) that constant-velocity prediction
+    # extrapolates from, plus the frame index each was accepted at - used to
+    # confirm the two are exactly one frame apart before trusting their
+    # implied velocity; a gap (from one or more frames failing to track in
+    # between) means that velocity actually spans more than one frame and
+    # would overshoot if extrapolated another single frame ahead, so
+    # prediction falls back to "no motion" instead in that case.
+    prev_pose = None
+    prev_pose_frame = None
+    cur_pose_frame = None
+    # Consecutive per-frame tracking failures since the last accepted pose -
+    # widens match_against_guided's search radius (see effective_window
+    # below) to compensate for the constant-velocity prediction growing
+    # staler the longer it goes unconfirmed.
+    n_consecutive_untracked = 0
     n_keyframes = 0
+    n_tracked_only = 0
     n_skipped = 0
 
     # --depth-densify state: an ML depth model, run only at accepted keyframes
@@ -510,6 +604,8 @@ def _demo():
 
             if ref_desc is None:
                 ref_kp, ref_desc, ref_image = kp, desc, frame.image
+                ref_R, ref_t = R_pos, t_pos
+                cur_pose_frame = frame.index
                 keyframe_poses[0] = KeyframePose(R_pos, t_pos, frame.timestamp)
                 continue
 
@@ -518,17 +614,22 @@ def _demo():
             status = "insufficient matches"
             parallax = 0.0
             is_keyframe = False
-
-            if len(matches_ref) >= 8:
+            pts1 = pts2 = np.empty((0, 2), dtype=np.float32)
+            has_ref_baseline = len(matches_ref) >= 8
+            if has_ref_baseline:
                 pts1 = np.float32([ref_kp[m.queryIdx].pt for m in matches_ref])
                 pts2 = np.float32([kp[m.trainIdx].pt for m in matches_ref])
                 parallax = median_parallax(pts1, pts2)
 
-                if parallax < args.min_parallax:
+            if len(sparse_map) == 0:
+                # --- Bootstrap: two-view pose + triangulation, once - still
+                # gated on accumulated parallax vs. the reference frame, since
+                # (unlike guided per-frame tracking below) a two-view
+                # essential-matrix solve has no map yet to be guided by and
+                # needs a real baseline to be well-conditioned at all ---
+                if has_ref_baseline and parallax < args.min_parallax:
                     status = "accumulating parallax"
-
-                elif len(sparse_map) == 0:
-                    # --- Bootstrap: two-view pose + triangulation, once ---
+                elif has_ref_baseline:
                     result = estimate_relative_pose(ref_kp, kp, matches_ref, K)
                     if result is None:
                         status = "bootstrap pose estimation failed"
@@ -573,7 +674,10 @@ def _demo():
                                 np.linalg.norm(camera_center(R_new, t_new) - camera_center(R_pos, t_pos))
                             )
 
+                            prev_pose = (R_pos, t_pos)
+                            prev_pose_frame = cur_pose_frame
                             R_pos, t_pos = R_new, t_new
+                            cur_pose_frame = frame.index
                             keyframe_poses.append(KeyframePose(R_pos, t_pos, frame.timestamp))
                             if not args.no_ba and len(keyframe_poses) % args.ba_every == 0:
                                 ba_result = _run_local_ba(keyframe_poses, keyframe_observations,
@@ -587,58 +691,100 @@ def _demo():
                             is_keyframe = True
                             status = f"BOOTSTRAP ({int(valid.sum())} points seeded)"
 
-                else:
-                    # --- Track: PnP against the existing map (confirmed points only -
-                    # provisional points must never influence the pose that could end
-                    # up confirming them) ---
-                    map_indices, frame_indices = sparse_map.match_against(
-                        desc, args.ratio, mask=sparse_map.confirmed
+            else:
+                # --- Track: motion-predicted guided PnP against the map,
+                # attempted every frame (confirmed points only - provisional
+                # points must never influence the pose that could end up
+                # confirming them). --min-parallax no longer gates whether a
+                # pose is estimated at all - only whether this frame's
+                # tracked pose *also* gets promoted to a keyframe, below. ---
+                track_accepted = False
+                if (
+                    prev_pose is not None
+                    and cur_pose_frame - prev_pose_frame == 1
+                    and frame.index - cur_pose_frame == 1
+                ):
+                    R_pred, t_pred = predict_constant_velocity(
+                        prev_pose[0], prev_pose[1], R_pos, t_pos
                     )
-                    if len(map_indices) < 6:
-                        status = f"too few map matches ({len(map_indices)})"
+                else:
+                    R_pred, t_pred = R_pos, t_pos
+
+                # Widen the search radius the longer tracking has gone without
+                # a successfully accepted pose: each consecutive failure means
+                # the constant-velocity prediction itself grows less trustworthy
+                # (extrapolated over a longer real gap than one frame), so the
+                # window compensates for that growing uncertainty - capped so a
+                # genuinely lost stretch still costs at most a few times the
+                # base window rather than degrading into a full-frame search.
+                effective_window = args.guided_window * min(
+                    1.0 + 0.5 * n_consecutive_untracked, 5.0
+                )
+                map_indices, frame_indices = sparse_map.match_against_guided(
+                    kp, desc, K, R_pred, t_pred,
+                    window=effective_window, ratio=args.ratio, mask=sparse_map.confirmed,
+                )
+                if len(map_indices) < 6:
+                    status = f"too few guided map matches ({len(map_indices)})"
+                else:
+                    object_points = sparse_map.points[map_indices]
+                    image_points = np.float32([kp[i].pt for i in frame_indices])
+                    result = estimate_pose_pnp(object_points, image_points, K)
+                    if result is None:
+                        status = "PnP failed"
                     else:
-                        object_points = sparse_map.points[map_indices]
-                        image_points = np.float32([kp[i].pt for i in frame_indices])
-                        result = estimate_pose_pnp(object_points, image_points, K)
-                        if result is None:
-                            status = "PnP failed"
+                        R_new, t_new, pnp_inlier_mask = result
+                        pnp_inliers = int(pnp_inlier_mask.sum())
+                        rot_deg = rotation_angle_deg(R_new @ R_pos.T)
+                        step_size = np.linalg.norm(
+                            camera_center(R_new, t_new) - camera_center(R_pos, t_pos)
+                        )
+                        implausible_step = (
+                            len(recent_step_sizes) >= 5
+                            and step_size > args.max_step_ratio * np.median(recent_step_sizes)
+                        )
+                        if pnp_inliers < args.pnp_min_inliers:
+                            status = f"PnP: too few inliers ({pnp_inliers})"
+                        elif rot_deg > args.max_plausible_rotation:
+                            # A confident-looking inlier count doesn't mean the pose is
+                            # right - PnP can lock onto a degenerate/ambiguous alternate
+                            # solution (near-planar or otherwise poorly depth-distributed
+                            # points are especially prone to this) that fits the same 2D
+                            # observations almost as well as the true pose. Real motion
+                            # between two close frames shouldn't produce a huge rotation
+                            # jump, so treat one as a red flag and reject it rather than
+                            # trusting whatever PnP returned.
+                            status = f"PnP: implausible rotation ({rot_deg:.1f}deg)"
+                        elif implausible_step:
+                            # Companion check: the same kind of degenerate PnP solution
+                            # doesn't always show up as a rotation flip - it can instead
+                            # keep a plausible rotation but put the camera in the wrong
+                            # place. Left unchecked, accepting this would also corrupt
+                            # every subsequent frame's rotation-vs-previous comparison
+                            # (measured against this now-wrong pose), which is how a
+                            # single undetected bad pose turns into a run of repeated
+                            # "implausible rotation" rejections afterward.
+                            status = (
+                                f"PnP: implausible step "
+                                f"({step_size:.2f} vs median {np.median(recent_step_sizes):.2f})"
+                            )
                         else:
-                            R_new, t_new, pnp_inlier_mask = result
-                            pnp_inliers = int(pnp_inlier_mask.sum())
-                            rot_deg = rotation_angle_deg(R_new @ R_pos.T)
-                            step_size = np.linalg.norm(
-                                camera_center(R_new, t_new) - camera_center(R_pos, t_pos)
-                            )
-                            implausible_step = (
-                                len(recent_step_sizes) >= 5
-                                and step_size > args.max_step_ratio * np.median(recent_step_sizes)
-                            )
-                            if pnp_inliers < args.pnp_min_inliers:
-                                status = f"PnP: too few inliers ({pnp_inliers})"
-                            elif rot_deg > args.max_plausible_rotation:
-                                # A confident-looking inlier count doesn't mean the pose is
-                                # right - PnP can lock onto a degenerate/ambiguous alternate
-                                # solution (near-planar or otherwise poorly depth-distributed
-                                # points are especially prone to this) that fits the same 2D
-                                # observations almost as well as the true pose. Real motion
-                                # between two close keyframes shouldn't produce a huge
-                                # rotation jump, so treat one as a red flag and reject it
-                                # rather than trusting whatever PnP returned.
-                                status = f"PnP: implausible rotation ({rot_deg:.1f}deg)"
-                            elif implausible_step:
-                                # Companion check: the same kind of degenerate PnP solution
-                                # doesn't always show up as a rotation flip - it can instead
-                                # keep a plausible rotation but put the camera in the wrong
-                                # place. Left unchecked, accepting this would also corrupt
-                                # every subsequent frame's rotation-vs-previous comparison
-                                # (measured against this now-wrong pose), which is how a
-                                # single undetected bad pose turns into a run of repeated
-                                # "implausible rotation" rejections afterward.
-                                status = (
-                                    f"PnP: implausible step "
-                                    f"({step_size:.2f} vs median {np.median(recent_step_sizes):.2f})"
-                                )
-                            else:
+                            # Pose accepted for this frame - update the running
+                            # estimate and motion history regardless of whether
+                            # this frame goes on to become a keyframe below, so
+                            # the constant-velocity prediction stays current
+                            # every frame rather than only at keyframes.
+                            recent_step_sizes.append(step_size)
+                            del recent_step_sizes[:-20]
+                            track_accepted = True
+                            prev_pose = (R_pos, t_pos)
+                            prev_pose_frame = cur_pose_frame
+                            R_pos, t_pos = R_new, t_new
+                            cur_pose_frame = frame.index
+
+                            if has_ref_baseline and parallax >= args.min_parallax:
+                                # --- Promote to keyframe: confirm provisional
+                                # points, triangulate new structure, run BA ---
                                 this_kf_observations = [
                                     (int(idx), float(x), float(y))
                                     for idx, (x, y) in zip(
@@ -685,8 +831,15 @@ def _demo():
 
                                 new_count = 0
                                 if len(candidates) >= 8:
+                                    # pts1/pts2 are ref-keyframe/current-frame pixel pairs
+                                    # (from matches_ref) - triangulate against the
+                                    # REFERENCE keyframe's own pose (ref_R/ref_t), not
+                                    # R_pos/t_pos, which by this point already equals
+                                    # R_new/t_new (updated above for every tracked frame,
+                                    # not just keyframes) and would give a zero-baseline,
+                                    # degenerate triangulation against itself.
                                     new_points, valid, in_front, parallax_deg = triangulate(
-                                        R_pos, t_pos, R_new, t_new, K,
+                                        ref_R, ref_t, R_new, t_new, K,
                                         pts1[new_mask], pts2[new_mask],
                                         min_parallax_deg=args.min_triangulation_angle,
                                     )
@@ -706,17 +859,13 @@ def _demo():
                                     )
                                     new_count = int(valid.sum())
 
-                                print(f"frame {frame.index}: TRACK  parallax={parallax:.1f}px  "
+                                print(f"frame {frame.index}: KEYFRAME  parallax={parallax:.1f}px  "
                                       f"rotation={rot_deg:.1f}deg  "
                                       f"{pnp_inliers}/{len(map_indices)} PnP inliers, "
                                       f"{new_count} new (provisional) points, "
                                       f"{n_reobserved} re-observed "
                                       f"({sparse_map.n_confirmed} confirmed / {len(sparse_map)} total)")
 
-                                recent_step_sizes.append(step_size)
-                                del recent_step_sizes[:-20]
-
-                                R_pos, t_pos = R_new, t_new
                                 keyframe_poses.append(KeyframePose(R_pos, t_pos, frame.timestamp))
                                 keyframe_observations.append(this_kf_observations)
                                 if not args.no_ba and len(keyframe_poses) % args.ba_every == 0:
@@ -744,7 +893,19 @@ def _demo():
 
                                 n_keyframes += 1
                                 is_keyframe = True
-                                status = f"TRACK ({pnp_inliers} inliers, {len(sparse_map)} map points)"
+                                status = f"KEYFRAME ({pnp_inliers} inliers, {len(sparse_map)} map points)"
+                            else:
+                                n_tracked_only += 1
+                                status = (
+                                    f"TRACK ({pnp_inliers}/{len(map_indices)} PnP inliers, "
+                                    f"frame-only)"
+                                )
+                                print(f"frame {frame.index}: TRACK  parallax={parallax:.1f}px  "
+                                      f"rotation={rot_deg:.1f}deg  "
+                                      f"{pnp_inliers}/{len(map_indices)} PnP inliers "
+                                      f"(frame-only, not a keyframe)")
+
+                n_consecutive_untracked = 0 if track_accepted else n_consecutive_untracked + 1
 
             if not args.no_display:
                 match_vis = cv2.drawMatches(
@@ -814,6 +975,7 @@ def _demo():
 
             if is_keyframe:
                 ref_kp, ref_desc, ref_image = kp, desc, frame.image
+                ref_R, ref_t = R_pos, t_pos
             else:
                 n_skipped += 1
 
@@ -822,7 +984,9 @@ def _demo():
 
     print(f"\n{n_keyframes} keyframes accepted "
           f"({sparse_map.n_confirmed} confirmed / {len(sparse_map)} total map points), "
-          f"{n_skipped} frames skipped")
+          f"{n_skipped} frames not promoted to a keyframe "
+          f"({n_tracked_only} still tracked frame-only, "
+          f"{n_skipped - n_tracked_only} lost tracking entirely)")
     if args.depth_densify:
         print(f"{len(ml_points)} ML-depth points sampled (sanity-check plot only - "
               f"not part of the tracked map)")
