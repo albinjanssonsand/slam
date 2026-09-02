@@ -187,7 +187,7 @@ def estimate_pose_pnp(object_points, image_points, camera_matrix):
 
 
 def _run_local_ba(keyframe_poses, keyframe_observations, sparse_map, camera_matrix, window,
-                   max_points=300):
+                   max_points=300, max_nfev=1000, ftol=1e-4, xtol=1e-4):
     """
     Compute a refinement of the last `window` keyframes' poses and the map
     points they observe - WITHOUT applying it. BA can itself occasionally
@@ -204,7 +204,10 @@ def _run_local_ba(keyframe_poses, keyframe_observations, sparse_map, camera_matr
     keyframe that added a lot of new structure at once), only the most
     recently added ones are kept - they're the ones most relevant to
     correcting recent drift, and this bounds the per-call cost so BA doesn't
-    visibly stall the pipeline at every keyframe.
+    visibly stall the pipeline at every keyframe. Pass max_points=None to
+    disable the cap entirely (see _run_global_ba, which passes the whole
+    trajectory as its "window" and needs every point kept, not just the
+    most recent).
     """
     from pipeline.bundle_adjustment import local_bundle_adjustment
 
@@ -218,7 +221,7 @@ def _run_local_ba(keyframe_poses, keyframe_observations, sparse_map, camera_matr
     if len(point_ids) < 10:
         return None  # not enough constraints for a meaningful refinement
 
-    if len(point_ids) > max_points:
+    if max_points is not None and len(point_ids) > max_points:
         # Prefer the most recently added points, but never let this starve a
         # keyframe down to too few observations - an under-constrained pose
         # (too few residuals for its 6 DOF) is far worse than a slightly
@@ -249,10 +252,69 @@ def _run_local_ba(keyframe_poses, keyframe_observations, sparse_map, camera_matr
 
     refined_rot, refined_trans, refined_pts = local_bundle_adjustment(
         rotations, translations, local_points, local_observations, camera_matrix,
-        fix_first_pose=True,
+        fix_first_pose=True, max_nfev=max_nfev, ftol=ftol, xtol=xtol,
     )
 
     return start, refined_rot, refined_trans, point_ids, refined_pts
+
+
+def _run_global_ba(keyframe_poses, keyframe_observations, sparse_map, camera_matrix,
+                    max_nfev=8000, ftol=1e-6, xtol=1e-6):
+    """
+    Full BA (paper Appendix; used offline in §VIII-E/Table VI): the same
+    optimizer local BA uses, scoped to every keyframe and every map point
+    instead of a sliding window - a thin wrapper around _run_local_ba rather
+    than a second optimizer, since local_bundle_adjustment already handles an
+    arbitrary keyframe/point set. window=len(keyframe_poses) makes
+    _run_local_ba's start index 0 (the whole trajectory); max_points=None
+    disables the point cap that exists only to bound per-keyframe cost during
+    tracking, which doesn't apply to a one-shot end-of-run refinement.
+
+    A full map needs far more solver iterations to converge than a small
+    local window, hence the higher max_nfev default than local_bundle_adjustment's.
+    ftol/xtol are tightened well past local BA's default (1e-4) for the same
+    reason: this pipeline runs local BA continuously throughout tracking, so
+    by the time a one-shot global pass runs, the map can already look
+    "converged" to a loose relative tolerance within just a few iterations
+    without local BA's incremental, overlapping-window refinements having
+    actually reached a true joint optimum over the whole trajectory -
+    confirmed empirically (the loose 1e-4 default terminated in ~20s with a
+    byte-identical trajectory on freiburg1_xyz).
+    """
+    return _run_local_ba(
+        keyframe_poses, keyframe_observations, sparse_map, camera_matrix,
+        window=len(keyframe_poses), max_points=None, max_nfev=max_nfev,
+        ftol=ftol, xtol=xtol,
+    )
+
+
+def _reprojection_error_stats(keyframe_poses, keyframe_observations, sparse_map, camera_matrix):
+    """
+    Mean/median/max reprojection error (px) across every (keyframe, point)
+    observation in the map - used to sanity-check a full BA result directly
+    (did it actually reduce error, not just "the solver returned"), since
+    full BA operates on the whole trajectory where an implausible-pose
+    check on the latest keyframe alone wouldn't catch a bad correction to an
+    older one.
+    """
+    errors = []
+    for kf_idx, kf_obs in enumerate(keyframe_observations):
+        if not kf_obs:
+            continue
+        R, t, _ = keyframe_poses[kf_idx]
+        pids = np.array([o[0] for o in kf_obs])
+        pixels = np.array([(o[1], o[2]) for o in kf_obs])
+        rvec, _ = cv2.Rodrigues(R)
+        proj, _ = cv2.projectPoints(sparse_map.points[pids], rvec, t, camera_matrix, None)
+        errors.append(np.linalg.norm(proj.reshape(-1, 2) - pixels, axis=1))
+    if not errors:
+        return None
+    errors = np.concatenate(errors)
+    return {
+        "mean": float(np.mean(errors)),
+        "median": float(np.median(errors)),
+        "max": float(np.max(errors)),
+    }
 
 
 def _apply_ba_result(keyframe_poses, sparse_map, ba_result):
@@ -263,7 +325,7 @@ def _apply_ba_result(keyframe_poses, sparse_map, ba_result):
 
 
 def _validate_and_apply_ba(ba_result, keyframe_poses, sparse_map, recent_step_sizes,
-                            fallback_R, fallback_t, args):
+                            fallback_R, fallback_t, max_plausible_rotation, max_step_ratio):
     """
     Apply a proposed BA refinement only if EVERY pose in the window still
     passes the same rotation/step plausibility checks used for a fresh PnP
@@ -274,6 +336,18 @@ def _validate_and_apply_ba(ba_result, keyframe_poses, sparse_map, recent_step_si
     silently; it would only show up later once that keyframe's rewritten
     position is reflected in the trajectory/plot, not at the moment of
     rejection.
+
+    max_plausible_rotation/max_step_ratio are passed explicitly rather than
+    read off `args` directly, because they mean something different for a
+    local-BA window than for a full/global one: `recent_step_sizes` is a
+    *per-frame tracking motion* statistic (typically cm-scale), which is the
+    right yardstick for "did local BA nudge a just-tracked keyframe somewhere
+    implausible" but the wrong one for "did full BA's cumulative drift
+    correction move an old keyframe further than one frame's worth of
+    motion" - the latter can legitimately be much larger without being wrong
+    (that's the entire point of running full BA). Local-BA call sites pass
+    args.max_plausible_rotation/args.max_step_ratio unchanged; the
+    global-BA call site passes its own, looser thresholds.
 
     Returns the (R, t) pose to use going forward: the BA-refined latest pose
     if the whole window is accepted, otherwise fallback_R/fallback_t (the
@@ -292,9 +366,9 @@ def _validate_and_apply_ba(ba_result, keyframe_poses, sparse_map, recent_step_si
         step_change = np.linalg.norm(
             camera_center(new_R, new_t) - camera_center(old_R, old_t)
         )
-        implausible = rot_change > args.max_plausible_rotation or (
+        implausible = rot_change > max_plausible_rotation or (
             len(recent_step_sizes) >= 5
-            and step_change > args.max_step_ratio * np.median(recent_step_sizes)
+            and step_change > max_step_ratio * np.median(recent_step_sizes)
         )
         if implausible:
             print(f"    [BA result rejected: implausible pose change at window index {i} "
@@ -515,6 +589,39 @@ def _demo():
                               "refines (keeps the most recently added ones if exceeded)")
     parser.add_argument("--no-ba", action="store_true",
                          help="Disable local bundle adjustment (for comparison)")
+    parser.add_argument("--global-ba-at-end", action="store_true",
+                         help="After tracking completes, run one full bundle adjustment pass "
+                              "over every keyframe and every map point (paper Appendix; offline "
+                              "accuracy refinement per paper §VIII-E) before writing "
+                              "--trajectory-output/--plot-output. Expensive relative to local "
+                              "BA - a one-shot end-of-run pass, not per-keyframe")
+    parser.add_argument("--global-ba-max-nfev", type=int, default=8000,
+                         help="Solver iteration budget for --global-ba-at-end - a full map "
+                              "needs far more than local BA's default (1000) to converge")
+    parser.add_argument("--global-ba-ftol", type=float, default=1e-6,
+                         help="Solver relative cost-change convergence tolerance for "
+                              "--global-ba-at-end, tighter than local BA's default (1e-4) - "
+                              "local BA already runs continuously during tracking, so a "
+                              "loose tolerance lets a one-shot global pass falsely report "
+                              "convergence after only a few iterations without reaching a "
+                              "true joint optimum over the whole trajectory")
+    parser.add_argument("--global-ba-xtol", type=float, default=1e-6,
+                         help="Solver relative parameter-change convergence tolerance for "
+                              "--global-ba-at-end - see --global-ba-ftol")
+    parser.add_argument("--global-ba-max-plausible-rotation", type=float, default=90.0,
+                         help="Per-keyframe rotation-change plausibility bound for "
+                              "--global-ba-at-end's result, looser than --max-plausible-rotation "
+                              "(15deg default, tuned for local BA/PnP) - a full-trajectory drift "
+                              "correction can legitimately move an old keyframe's rotation more "
+                              "than a per-frame sanity check allows; this still catches a wild "
+                              "PnP-ambiguity-style flip")
+    parser.add_argument("--global-ba-max-step-ratio", type=float, default=200.0,
+                         help="Per-keyframe step-change plausibility bound for "
+                              "--global-ba-at-end's result (as a multiple of recent per-frame "
+                              "tracking step size), looser than --max-step-ratio (6.0 default, "
+                              "tuned for local BA/PnP) for the same reason as "
+                              "--global-ba-max-plausible-rotation - a full-trajectory correction "
+                              "isn't bounded by one frame's worth of motion")
     parser.add_argument("--plot-output", default="results/map_trajectory.png")
     parser.add_argument("--trajectory-output",
                          help="Write each accepted keyframe's pose to this path in TUM format "
@@ -685,7 +792,8 @@ def _demo():
                                                            max_points=args.ba_max_points)
                                 R_pos, t_pos = _validate_and_apply_ba(
                                     ba_result, keyframe_poses, sparse_map,
-                                    recent_step_sizes, R_pos, t_pos, args,
+                                    recent_step_sizes, R_pos, t_pos,
+                                    args.max_plausible_rotation, args.max_step_ratio,
                                 )
                             n_keyframes += 1
                             is_keyframe = True
@@ -874,7 +982,8 @@ def _demo():
                                                                max_points=args.ba_max_points)
                                     R_pos, t_pos = _validate_and_apply_ba(
                                         ba_result, keyframe_poses, sparse_map,
-                                        recent_step_sizes, R_pos, t_pos, args,
+                                        recent_step_sizes, R_pos, t_pos,
+                                        args.max_plausible_rotation, args.max_step_ratio,
                                     )
 
                                 if args.depth_densify:
@@ -990,6 +1099,41 @@ def _demo():
     if args.depth_densify:
         print(f"{len(ml_points)} ML-depth points sampled (sanity-check plot only - "
               f"not part of the tracked map)")
+
+    if args.global_ba_at_end:
+        import time
+
+        if len(keyframe_poses) < 2:
+            print("[global BA: skipped - fewer than 2 keyframes]")
+        else:
+            before_stats = _reprojection_error_stats(
+                keyframe_poses, keyframe_observations, sparse_map, K
+            )
+            t0 = time.perf_counter()
+            ba_result = _run_global_ba(
+                keyframe_poses, keyframe_observations, sparse_map, K,
+                max_nfev=args.global_ba_max_nfev,
+                ftol=args.global_ba_ftol, xtol=args.global_ba_xtol,
+            )
+            elapsed = time.perf_counter() - t0
+            if ba_result is None:
+                print(f"[global BA: skipped in {elapsed:.1f}s - fewer than 10 map points "
+                      f"observed across the trajectory]")
+            else:
+                _validate_and_apply_ba(
+                    ba_result, keyframe_poses, sparse_map, recent_step_sizes,
+                    keyframe_poses[-1].R, keyframe_poses[-1].t,
+                    args.global_ba_max_plausible_rotation, args.global_ba_max_step_ratio,
+                )
+                after_stats = _reprojection_error_stats(
+                    keyframe_poses, keyframe_observations, sparse_map, K
+                )
+                print(f"[global BA: {elapsed:.1f}s - reprojection error (px) "
+                      f"mean {before_stats['mean']:.2f}->{after_stats['mean']:.2f}, "
+                      f"median {before_stats['median']:.2f}->{after_stats['median']:.2f}, "
+                      f"max {before_stats['max']:.2f}->{after_stats['max']:.2f} "
+                      f"(unchanged before==after if the result was rejected as implausible - "
+                      f"see message above)]")
 
     positions = _keyframe_positions(keyframe_poses)
 
