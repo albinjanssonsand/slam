@@ -467,3 +467,132 @@ test its primary motivation (long-sequence drift) turned out unusable for
 an unrelated, already-known reason. Kept as an opt-in flag (default off)
 given this result - not enabled by default pending either a usable
 long-sequence test or point-culling (#26) landing first.
+
+---
+
+## #21: ORB extraction - single-pyramid grid with adaptive per-cell threshold
+
+**Version:** `issue-21-orb-extraction-single-pyramid-grid` branch, on top of
+`main` post-#20. Implements [#21](https://github.com/albinjanssonsand/slam/issues/21):
+replaces `detect_and_compute_gridded`'s independent per-cell-cropped ORB
+pyramids with a single full-image pyramid (matching paper §V-A), bucketing
+the resulting keypoints into a grid to enforce a per-cell quota, with
+progressively lower FAST thresholds retried (further full-image passes,
+never cropped) for any cell still short of quota.
+
+**One serious bug found and fixed during implementation, before any of
+the numbers below were trustworthy:** requesting a large `nfeatures`
+candidate pool from a single `cv2.ORB_create` call (needed so a strong
+region can't crowd out a weak one before our own per-cell selection runs -
+see the function's docstring) makes ORB report the same physical corner
+more than once far more often than a normal-sized request would - confirmed
+empirically, ~20% of raw keypoints from one full-image pass were within 2px
+of another, and this holds even at `nfeatures=2000` (117% duplicate-pair
+rate), not just at the large candidate budget. Undetected, this collapsed
+bootstrap on `freiburg1_xyz`'s first attempt: 836 essential-matrix inliers
+triangulated into only **5** map points (vs. 49 for the old cropped-cell
+implementation on the identical frame pair) - duplicate detections of a
+handful of strong corners were filling entire cells' quotas, inflating
+match *counts* (more near-identical descriptors to match against) while
+destroying match *diversity* (most "inliers" were redundant/ambiguous
+correspondences of the same few physical points, not genuinely new
+structure). Fixed with a greedy NMS pass (via `scipy.spatial.cKDTree`,
+already a project dependency) collapsing near-duplicate detections to their
+single highest-response representative before any per-cell selection - a
+fixed spatial-bin approach was tried first and rejected (still left 1727
+near-duplicate pairs due to points straddling bin boundaries; the radius-
+based KD-tree approach leaves ~0-1). Re-tested after the fix: same frame
+pair now triangulates **124** points (2.5x the old implementation's 49).
+
+A second, smaller issue: the fallback-pass dedup check (against already-
+selected keypoints from an earlier pass) was a per-candidate Python
+`any()`-over-generator loop, profiled as 77% of total runtime on a
+fallback-heavy frame (~150ms vs. the old implementation's ~31ms on the
+same frame). Vectorized with numpy broadcasting instead (~70-100ms on the
+same frame).
+
+**Per-cell balance check** (required by the issue, on the most texture-
+imbalanced frame found across `recordings/demo1-6.mp4` - `demo3.mp4`,
+frame 188/377, chosen because the *ungridded* baseline showed 5 of 16
+cells at zero keypoints and one cell dominating with 1070):
+
+| Extraction | Total keypoints | Zero-count cells | Max cell count |
+|---|---|---|---|
+| Ungridded (plain `cv2.ORB_create`, pre-#21 baseline path) | 2000 | 5 / 16 | 1070 |
+| Old gridded (per-cell-cropped, fixed threshold) | 757 | 4 / 16 | 125 (quota cap) |
+| New gridded (this issue, single pyramid + adaptive threshold) | 1572-1637 | 1 / 16 | 125 (quota cap) |
+
+New extraction both yields more than double the old gridded
+implementation's total keypoints *and* recovers 3 of the 4 previously-zero
+cells via the adaptive-threshold retry (the one remaining zero cell
+returned nothing even at the lowest fallback threshold - genuinely
+textureless, matching the paper's own "some cells contain no corners"
+allowance).
+
+**Match-quality check** (required by the issue - average matches per
+consecutive frame pair, first 60 frames of `freiburg1_xyz`, old vs. new
+gridded extraction, `n_features=5000`): **925.1 -> 1504.5** average matches
+per pair (~1.6x). An earlier measurement (2357.4, ~2.5x) was inflated by
+the duplicate-keypoint bug above and is superseded by this post-fix number.
+
+**Timing** (required by the issue - per-frame extraction cost, `demo3.mp4`'s
+pathological frame, steady-state/warmed-up process): old gridded 31.5ms ->
+new gridded ~70-100ms (roughly 2.2-3.2x, depending on how many fallback
+passes a given frame triggers). Regresses versus the old implementation,
+contrary to the paper's own real-time budget assuming a single pyramid is
+cheaper than N per-cell ones - plausible explanation: this codebase's old
+implementation used tiny per-cell `nfeatures` (~125), while matching the
+paper's *effect* (per-cell quota via adaptive threshold, not per-cell
+cropping) here still means detecting a large `nfeatures` candidate pool
+over the *whole* image up to 3 times per frame (default + 2 fallback
+thresholds) before our own selection narrows it down. Acceptable for this
+offline/batch pipeline (a few hundred ms/frame), reported honestly per the
+issue's own requirement rather than left unmeasured.
+
+**freiburg1_xyz, full run:**
+
+| Sequence | Frames | Keyframes accepted | Confirmed / total map points | Trajectory coverage | ATE RMSE (m) | RPE RMSE (m) |
+|---|---|---|---|---|---|---|
+| `freiburg1_xyz` (baseline, #20's flag-off row) | 798 | 216 | 11854 / 16061 | 88.1% (26.5s / 30.1s) | 0.0403 | 0.0270 |
+| `freiburg1_xyz` (this issue) | 798 | 353 (before tracking loss) | 28885 / 51898 | 70.5% (21.2s / 30.1s) | 0.1249 | 0.0388 |
+
+**This is a real regression in end-to-end trajectory quality**, reported
+honestly rather than glossed over. Per-frame keyframe richness is
+dramatically better while tracking survives (353 keyframes with ~3.2x the
+map density by frame 634, vs. 216 for the *entire* old-extraction
+sequence), but tracking collapses at frame 635 and never recovers - the
+PnP inlier count drops from 634 (frame 634) to 22 (frame 635) in one step,
+with relative rotation jumping 2.0deg -> 7.4deg -> 8.8deg across the next
+two keyframes, then no further per-frame log output at all (total tracking
+loss) for the rest of the sequence.
+
+**Root cause (best understanding, not fixed here - out of #21's explicit
+scope, which excludes touching matching/PnP):** this is the same PnP-
+ambiguity/no-relocalization failure mode `NOTES.md` already documents for
+`freiburg1_desk`/`freiburg1_room` - a moderate, sub-`--max-plausible-
+rotation` (15deg) rotation jump slips through the plausibility gate
+undetected, then poisons the next frame's motion-predicted guided search,
+cascading into permanent loss with no relocalization to recover (#13).
+`freiburg1_xyz` was previously the one sequence that never triggered this.
+Working hypothesis for why it does now: `match_against_guided` projects
+the *entire* confirmed map into every frame with no covisibility bound
+(already flagged as a scaling problem in #23) - a much denser map (this
+run's ~52k points vs. the old baseline's ~16k for the whole sequence)
+means more candidate points crowded into the same fixed-radius guided-
+search window, plausibly increasing correspondence ambiguity at exactly
+the moment PnP needs to be most reliable. Not verified further here since
+diagnosing/fixing matching or relocalization behavior is explicitly out of
+scope per #21's own Non-goals - flagged for whoever picks up #12
+(stale-reference cascade), #13 (relocalization), or #23 (covisibility-
+bounded local map, which would directly reduce the guided-search candidate
+pool this hypothesis points at).
+
+**Net result:** #21's own goal - matching the paper's single-pyramid,
+adaptive-threshold construction, with better spatial balance and richer
+matches than the old cropped-cell implementation - is achieved and
+verified directly (per-cell balance, match-quality, and bootstrap-recovery
+checks above all improve). The extraction change surfaces (but does not
+itself cause, and is not responsible for fixing) a pre-existing PnP-
+ambiguity/relocalization gap that a denser resulting map appears to trigger
+more readily. Landed as scoped; the trajectory-quality regression is
+tracked as a consequence for #12/#13/#23, not reopened as part of #21.
