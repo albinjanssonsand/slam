@@ -259,3 +259,97 @@ correctness bugs along the way (below), and its motion-prediction /
 per-frame-tracking infrastructure is very likely what #13's relocalization
 trigger (detecting sustained per-frame tracking failure) should build on
 top of. It just isn't, by itself, the fix for tracking loss.
+
+---
+
+## #17: freiburg2 sequences (broader ground-truth baseline set)
+
+**Version:** `main` @ `ff105cdfc963fe1ac0656eed60e697b223407e60` (#15
+merged; `--depth-densify` not passed). Extends the ground-truth baseline
+set per [#17](https://github.com/albinjanssonsand/slam/issues/17): with
+only `freiburg1_xyz` usable so far (`desk`/`room`: tracking loss; `rpy`:
+bootstrap failure - see above), this evaluates `freiburg2` sequences
+chosen specifically to avoid both known failure modes - a second slow/clean
+sequence on a different camera rig (`freiburg2_xyz`) and a robot-mounted
+sequence with no handheld shake (`freiburg2_pioneer_slam2`).
+
+**Calibration:** `calibration/tum_freiburg2.yaml`, `freiburg2`'s published
+RGB camera intrinsics (TUM download page / ORB-SLAM2's `TUM2.yaml`, cross-
+checked to agree), same schema as `calibration/tum_freiburg1.yaml`.
+
+**Reproduction** (for any sequence `<seq>` in `xyz`, `pioneer_slam2`):
+
+```bash
+python -m pipeline.mapping \
+  --video datasets/tum/rgbd_dataset_freiburg2_<seq> \
+  --calibration calibration/tum_freiburg2.yaml \
+  --trajectory-output results/guided_freiburg2_<seq>_estimate.txt \
+  --plot-output results/guided_freiburg2_<seq>_trajectory.png \
+  --no-display
+
+evo_ape tum datasets/tum/rgbd_dataset_freiburg2_<seq>/groundtruth.txt results/guided_freiburg2_<seq>_estimate.txt -a -s
+evo_rpe tum datasets/tum/rgbd_dataset_freiburg2_<seq>/groundtruth.txt results/guided_freiburg2_<seq>_estimate.txt -a -s
+
+python scripts/plot_trajectory.py \
+  --estimate results/guided_freiburg2_<seq>_estimate.txt \
+  --groundtruth datasets/tum/rgbd_dataset_freiburg2_<seq>/groundtruth.txt \
+  --output results/guided_freiburg2_<seq>_vs_groundtruth.png
+```
+
+| Sequence | Frames | Keyframes accepted | Confirmed / total map points | Trajectory coverage | ATE RMSE (m) | RPE RMSE (m) | Status |
+|---|---|---|---|---|---|---|---|
+| `freiburg2_xyz` | 3669 | 305 | 17436 / 26692 | 98.6% (121.0s / 122.7s) | 0.1589 | 0.0456 | OK |
+| `freiburg2_pioneer_slam2` | 2113 | 44 | 208 / 226 | 5.2% (6.0s / 115.6s) | 0.0264 | 0.0239 | **Too hard** (tracking loss) |
+
+**Notes:**
+
+- **`freiburg2_xyz` is a second usable ground-truth baseline**, on a
+  different camera rig than `freiburg1`. Tracks the full sequence at 98.6%
+  coverage (305 keyframes; 3226 of the 3363 non-keyframe frames still get a
+  frame-only pose, only 137 lose tracking). ATE RMSE (0.159m) is notably
+  higher than `freiburg1_xyz`'s 0.040m despite `freiburg2_xyz` being the
+  nominally "easier" sequence (translation-only, explicitly low motion
+  blur/rolling shutter per its TUM listing) - but plotted against ground
+  truth (`results/guided_freiburg2_xyz_vs_groundtruth.png`), the aligned
+  estimate correctly follows the same diagonal sweep and central back-and-
+  forth pattern as ground truth, just noisier throughout, not a
+  qualitatively wrong trajectory. Not investigated further here (#17 is
+  dataset acquisition/evaluation only, no pipeline changes in scope), but
+  worth a look before treating `freiburg2_xyz` as equally reliable as
+  `freiburg1_xyz` for future ML-fusion comparisons.
+- **`freiburg2_pioneer_slam2` reproduces the exact `desk`/`room`
+  tracking-loss failure mode**, on a robot-mounted rig this time rather
+  than handheld: per-keyframe PnP inlier count declines through the last
+  few keyframes before death (83 -> 69 -> 65 -> 58 -> 57 -> 53 -> 42 -> 43
+  -> 24) and dies permanently at **frame 181/2113** (8.6% into the
+  sequence) - of the 2068 frames that don't get promoted to a keyframe,
+  1978 lose tracking entirely rather than just failing keyframe promotion,
+  nearly all of them in the tail after frame 181. The plot
+  (`results/guided_freiburg2_pioneer_slam2_vs_groundtruth.png`)
+  shows the same signature already seen with `desk`/`room`: a small
+  scribble near the start point while ground truth sweeps through the
+  whole hall. ATE/RPE look deceptively reasonable (0.026m / 0.024m) despite
+  only 5.2% coverage - exactly the case the "too hard" coverage check
+  exists to catch. This is further evidence that the dominant tracking-loss
+  cause (zero view overlap with the confirmed map, per the root-cause
+  analysis above) isn't specific to `freiburg1`'s handheld motion or
+  camera - it reproduces on a different rig and a different kind of scene
+  (open hall vs. desk/room), consistent with #13 (relocalization) being the
+  fix that's actually needed, not something `freiburg1`-specific.
+- **`pioneer_slam`/`pioneer_slam3` skipped, not attempted**, per #17's own
+  contingency ("documented as skipped with why, if it fails for a
+  systemic reason worth understanding first"). `pioneer_slam2` failed via
+  the same already-diagnosed tracking-loss mechanism as `desk`/`room`
+  (declining PnP inlier count -> permanent loss, no relocalization) - not a
+  new or freiburg2-specific problem needing further investigation.
+  `pioneer_slam` (the longest and most demanding of the four per #17) and
+  `pioneer_slam3` (a "similar profile to `slam2`") are both robot-mounted
+  hall/maze sequences with a comparable motion profile to `slam2`, so they
+  would very likely reproduce the same failure without adding new
+  diagnostic information - not worth the additional ~3GB download here.
+  Revisit once #13 (relocalization) lands.
+- **Net result: freiburg2 contributes one new usable ground-truth
+  baseline (`freiburg2_xyz`)**, alongside `freiburg1_xyz`.
+  `freiburg2_pioneer_slam2`'s failure is additional evidence for the
+  tracking-loss root cause already tracked under #13, not a new distinct
+  failure mode.
