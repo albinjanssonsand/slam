@@ -353,3 +353,117 @@ python scripts/plot_trajectory.py \
   `freiburg2_pioneer_slam2`'s failure is additional evidence for the
   tracking-loss root cause already tracked under #13, not a new distinct
   failure mode.
+
+---
+
+## #20: full/global bundle adjustment offline refinement
+
+**Version:** `issue-20-generalize-bundle-adjustment-to-full-global-ba`
+branch, on top of `main` post-#17 (`--depth-densify` not passed).
+Implements [#20](https://github.com/albinjanssonsand/slam/issues/20): a
+`--global-ba-at-end` flag that runs one full bundle adjustment pass (every
+keyframe pose except the first, plus every map point, jointly refined) over
+the whole trajectory after tracking completes, reusing
+`bundle_adjustment.local_bundle_adjustment` via a thin `_run_global_ba`
+wrapper rather than a second optimizer.
+
+**Two problems found and fixed during implementation, before any of the
+numbers below were trustworthy:**
+
+- **Plausibility-gate scale mismatch.** The propose-then-validate pattern
+  (`_validate_and_apply_ba`) reused for the global result was, by default,
+  checking each keyframe's correction against `--max-plausible-rotation`/
+  `--max-step-ratio` - thresholds calibrated against `recent_step_sizes`, a
+  *per-frame tracking motion* statistic. A legitimate full-trajectory drift
+  correction to an old keyframe can be far larger than one frame's typical
+  step without being wrong, so reusing those thresholds unchanged risked
+  silently rejecting every real correction and making the flag a no-op.
+  Fixed by threading explicit `max_plausible_rotation`/`max_step_ratio`
+  parameters through `_validate_and_apply_ba` instead of reading `args`
+  directly, and adding separate, looser `--global-ba-max-plausible-rotation`
+  (90°) / `--global-ba-max-step-ratio` (200x) flags for the global case;
+  local BA's two existing call sites pass `args.max_plausible_rotation`/
+  `args.max_step_ratio` unchanged (confirmed byte-identical output with the
+  flag off, below).
+- **Premature convergence from reused local-BA tolerances.** First
+  measurement: `--global-ba-at-end` on `freiburg1_xyz` finished in 20.5s and
+  produced a **byte-identical** output trajectory - not "improved by an
+  imperceptible amount," genuinely unchanged. Root cause: `least_squares`'
+  `ftol`/`xtol` were hardcoded to `1e-4` inside `local_bundle_adjustment`,
+  tuned for local BA's "exit fast once good enough" per-keyframe use case.
+  Because local BA already runs continuously throughout tracking, the map
+  going into the global pass is already close to a local optimum, so a loose
+  relative tolerance let the solver report convergence within a handful of
+  iterations without doing meaningful work. Exposed `ftol`/`xtol` as
+  parameters on `local_bundle_adjustment`/`_run_local_ba` (existing callers
+  unaffected - defaults unchanged) and gave `_run_global_ba` its own
+  tightened defaults (`1e-6`, vs. local BA's `1e-4`) via new
+  `--global-ba-ftol`/`--global-ba-xtol` flags. Re-measured after the fix:
+  results below.
+
+**freiburg1_xyz, flag off (regression check):**
+
+| Sequence | Frames | Keyframes accepted | Confirmed / total map points | Trajectory coverage | ATE RMSE (m) | RPE RMSE (m) |
+|---|---|---|---|---|---|---|
+| `freiburg1_xyz` | 798 | 216 | 11854 / 16061 | 88.1% (26.5s / 30.1s) | 0.0403 | 0.0270 |
+
+Exact match to the #15 baseline row above (same keyframe/point counts, same
+ATE/RPE to 4 decimal places) - confirms the `_validate_and_apply_ba`
+signature refactor didn't change local-BA/tracking behavior.
+
+**freiburg1_xyz, flag on:**
+
+| Sequence | Keyframes accepted | Trajectory coverage | ATE RMSE (m) | RPE RMSE (m) | Global BA time | Reprojection error (px) mean | Reprojection error (px) max |
+|---|---|---|---|---|---|---|---|
+| `freiburg1_xyz` | 216 (same) | 88.1% (same) | 0.0406 | 0.0274 | 25.5s | 3.39 -> 2.68 | 105703.46 -> 1844.98 |
+
+Result was accepted (no `[BA result rejected...]` message for the global
+pass; all 217 lines of the trajectory file differ from the flag-off run -
+every keyframe pose moved, if only slightly for most of them). Global BA measurably
+reduces raw reprojection error - mean improves ~21% (3.39px -> 2.68px), and
+one severely mistriangulated point drops from 105,703px of reprojection
+error to 1,845px (still bad, but two orders of magnitude less catastrophic;
+consistent with there being no map-point culling yet - #26's territory).
+
+**But ATE/RPE against ground truth get very slightly *worse*, not
+better**: ATE RMSE 0.0403m -> 0.0406m (+0.7%), RPE RMSE 0.0270m -> 0.0274m
+(+1.5%). Reported honestly per the issue's own acceptance criteria - global
+BA is not a free win here. Plausible explanation (not verified further,
+out of scope for this issue): minimizing raw reprojection error over a map
+that still contains unculled outliers/mismatches isn't the same objective
+as minimizing Sim(3)-aligned distance to an independently-measured ground
+truth trajectory - correcting the worst outlier's local geometry can
+redistribute residual error elsewhere in a way that doesn't help (or
+slightly hurts) the global alignment. Consistent with `EVALUATION_RESULTS.md`
+generally: this pipeline has no point-culling yet (#26), so full BA is
+optimizing against known-imperfect data.
+
+**freiburg2_pioneer_slam2: not usable as the intended long-sequence-drift
+proxy.** This issue's own scope note picked `pioneer_slam2` (2116 frames)
+as a longer stand-in for `NOTES.md`'s diagnosed long-sequence PnP-inlier
+decline, since `freiburg1_xyz` (798 frames) is too short to exercise it.
+It turns out `pioneer_slam2` was already shown, in #17's evaluation above,
+to fail via total tracking loss at frame ~181/2116 (**already documented,
+not rediscovered here**) - the same zero-view-overlap failure mode as
+`freiburg1_desk`/`freiburg1_room`, unrelated to BA. Re-confirmed here: 44
+keyframes accepted before permanent tracking loss, 8.5% coverage, ATE RMSE
+0.0264m (the same "deceptively low ATE on a tiny tracked prefix" trap the
+coverage check exists to catch - not a real accuracy number). With only 44
+keyframes tracked, this sequence can't exercise the 800+-keyframe drift
+scenario it was picked for, so the global-BA-on variant wasn't run against
+it - would only reproduce the small-map freiburg1_xyz result at a smaller
+scale, not test anything new. **`NOTES.md`'s original long-sequence-drift
+question remains untested by this issue** - a real TUM/recording sequence
+that (a) tracks continuously for 800+ keyframes and (b) has ground truth
+doesn't currently exist in this repo's dataset set. Worth flagging for
+whoever picks up #23/#27, which point at this same sequence for the same
+reason and will hit the identical dead end.
+
+**Net result:** `--global-ba-at-end` works correctly (converges, measurably
+reduces reprojection error, propose-then-validate gate functions as
+designed) but does not demonstrate an ATE/RPE improvement on the only
+sequence it could actually be tested against, and the sequence meant to
+test its primary motivation (long-sequence drift) turned out unusable for
+an unrelated, already-known reason. Kept as an opt-in flag (default off)
+given this result - not enabled by default pending either a usable
+long-sequence test or point-culling (#26) landing first.

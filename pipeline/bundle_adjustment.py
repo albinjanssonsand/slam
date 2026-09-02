@@ -45,7 +45,8 @@ def _build_sparsity(kf_idx, pt_idx, n_free_poses, n_points, first_free):
 
 
 def local_bundle_adjustment(rotations, translations, points, observations, camera_matrix,
-                             fix_first_pose=True, outlier_threshold_px=3.0, max_nfev=1000):
+                             fix_first_pose=True, outlier_threshold_px=3.0, max_nfev=1000,
+                             ftol=1e-4, xtol=1e-4):
     """
     rotations, translations - lists of length K: world-to-camera poses
                                (X_cam = R @ X_world + t) for K keyframes.
@@ -56,6 +57,17 @@ def local_bundle_adjustment(rotations, translations, points, observations, camer
     camera_matrix           - shared 3x3 intrinsics.
     fix_first_pose          - hold rotations[0]/translations[0] fixed as the
                                gauge anchor for this window.
+    ftol, xtol              - least_squares relative convergence tolerances.
+                               The defaults are tuned for local BA's per-keyframe
+                               use case (exit fast once "good enough" - see the
+                               comment at the solver call below); a one-shot
+                               full-map pass has no such time pressure and
+                               should be allowed to converge tighter, since a
+                               map already refined incrementally by many
+                               overlapping local BA windows can otherwise look
+                               "converged" to a loose xtol/ftol within a
+                               handful of iterations without actually reaching
+                               a joint optimum (see _run_global_ba).
     outlier_threshold_px    - Huber loss transition point (pixels). Feature
                                matching occasionally lets a wrong correspondence
                                through the earlier RANSAC checks; with plain
@@ -113,7 +125,7 @@ def local_bundle_adjustment(rotations, translations, points, observations, camer
     result = least_squares(
         residuals, x0, jac_sparsity=sparsity, method="trf",
         loss="huber", f_scale=outlier_threshold_px,
-        max_nfev=max_nfev, ftol=1e-4, xtol=1e-4, verbose=0,
+        max_nfev=max_nfev, ftol=ftol, xtol=xtol, verbose=0,
     )
 
     free_rvecs = result.x[:n_free_poses * 3].reshape(n_free_poses, 3)
