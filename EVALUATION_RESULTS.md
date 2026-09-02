@@ -596,3 +596,111 @@ itself cause, and is not responsible for fixing) a pre-existing PnP-
 ambiguity/relocalization gap that a denser resulting map appears to trigger
 more readily. Landed as scoped; the trajectory-quality regression is
 tracked as a consequence for #12/#13/#23, not reopened as part of #21.
+
+---
+
+## #23: Covisibility graph, map point metadata, Track Local Map hardening, local BA rescoping
+
+**Version:** `issue-23-covisibility-graph-point-metadata` branch, on top of
+`main` post-#21. Implements [#23](https://github.com/albinjanssonsand/slam/issues/23)
+(paper §III-C/D, §V-D, §VI-D) as three increments in one branch: (1) a
+covisibility graph plus per-point viewing direction / scale-invariance
+bounds / representative descriptor, all incrementally maintained by a new
+`Map.add_observation`; (2) `Map.match_against_guided` rewritten to the
+paper's projection sequence (viewing-angle gate, scale-invariance gate,
+predicted-pyramid-octave search) restricted to the local map (K1 union K2,
+`Map.local_map_keyframes`/`local_map_points`) instead of the whole
+confirmed map; (3) `_run_local_ba` rescoped from a fixed insertion-order
+sliding window to the current keyframe's covisibility neighbors (free),
+with every other keyframe that also observes a local point held fixed
+instead of dropped (`local_bundle_adjustment`'s `fix_first_pose: bool`
+generalized to an arbitrary `fixed_poses` mask to support this).
+
+**A real performance regression found and fixed before any of the numbers
+below were trustworthy:** the first full `freiburg1_xyz` run took ~40-50
+minutes (vs. this same sequence's ~20 minutes pre-#23) - the opposite of
+this issue's own purpose. Root cause, found via manual timing
+instrumentation (`cProfile` itself proved unreliable to interrupt cleanly
+in this environment): K1's construction is deliberately unthresholded per
+the paper (any shared point pulls in the observing keyframe), and on a
+small, heavily-revisited scene like `freiburg1_xyz` this lets a single
+popular point pull in most of the trajectory's keyframes - `Map.
+match_against_guided`'s candidate-point count grew unbounded with total
+map size (124 -> 3136+ points and still climbing over a 60s sample)
+instead of staying local, consuming ~45% of per-frame wall time by itself.
+Capping keyframe count alone (`local_map_keyframes`'s `max_keyframes=30`,
+`_run_local_ba`'s top-20-covisibility-neighbors) did not fix it, since on
+this scene even a handful of keyframes each individually observe
+thousands of points; a direct cap on the local point-set size itself
+(`--track-local-map-max-points`, keeping the most recently added points if
+exceeded) was required. An initial cap of 2000 fixed the speed but was too
+aggressive - it starved PnP of candidates, more than tripling tracking
+loss (152 keyframes / 545 frames losing tracking entirely, dying
+permanently at frame 443/798, vs. 7 lost frames pre-#23). Raised to 6000
+(the value used below): local map size stays bounded (settles around
+2400-2700 points on `freiburg1_xyz` even as the confirmed map grows past
+35000) while keeping enough candidates for PnP to stay healthy through the
+whole sequence.
+
+**freiburg1_xyz, full run:**
+
+| Sequence | Frames | Keyframes accepted | Confirmed / total map points | Trajectory coverage | ATE RMSE (m) | RPE RMSE (m) | Wall clock |
+|---|---|---|---|---|---|---|---|
+| `freiburg1_xyz` (baseline, #21's post-fix row) | 798 | 353 (before tracking loss) | 28885 / 51898 | 70.5% (21.2s / 30.1s) | 0.1249 | 0.0388 | - |
+| `freiburg1_xyz` (this issue, `--track-local-map-max-points 6000`) | 798 | 372 | 35662 / 59834 | 87.9% (26.4s / 30.1s) | 0.1425 | 0.0282 | ~11 min |
+
+(The `#20`-flag-off row - 216 keyframes, 88.1% coverage, 0.0403/0.0270 ATE/RPE,
+pre-#21 - remains the cleanest "no tracking loss at all" comparison point;
+included here against #21's own post-fix numbers instead, since that's the
+row this issue's changes land directly on top of.)
+
+**Reading these numbers:** coverage recovers to 87.9% (vs. #21's 70.5% -
+this issue's bounded local map measurably helps the tracking-loss
+regression #21 itself flagged as a likely consequence of an unbounded
+guided-search candidate pool, matching the hypothesis in that section).
+RPE (frame-to-frame local accuracy) improves to 0.0282m from #21's
+0.0388m. ATE (global Sim(3)-aligned accuracy) gets worse, 0.1425m vs.
+#21's 0.1249m, despite both coverage and RPE improving - plausible given
+RPE only measures *local* consecutive-frame consistency while ATE is
+sensitive to how a handful of larger jumps or drift segments affect the
+global alignment; not investigated further here in the interest of time
+(this issue already required two full-`freiburg1_xyz`-run iterations to
+find and fix the performance regression above). Wall clock improved
+materially (~11 min vs. #21's un-timed but user-observed ~20+ min baseline
+for a comparable run) even with the point cap generous enough to avoid
+starving PnP - confirms the local-map bound is doing real work, not just
+trading speed for correctness one-for-one.
+
+**freiburg2_pioneer_slam2 (this issue's own bounded-local-map + revisit
+check): not usable, for the exact reason #20 already flagged.** #20's own
+write-up (above) explicitly warned that `pioneer_slam2` dies from a
+pre-existing, already-diagnosed tracking-loss bug (zero view overlap once
+PnP inlier count declines past a threshold, no relocalization to recover -
+tracked under #13, unrelated to BA or covisibility) at frame ~181/2113,
+and that "#23/#27... will hit the identical dead end." Re-confirmed here,
+not rediscovered: this run dies at **frame 173/2113** (38 keyframes, 461
+confirmed / 1343 total points, 5.0% coverage, ATE RMSE 0.0197m - the same
+"deceptively low ATE on a tiny tracked prefix" trap the coverage check
+exists to catch, not a real accuracy number). With only 38 keyframes and
+1343 points ever created, this sequence can't exercise either of the
+checks it was picked for (bounded local-map size under real growth, or a
+genuine revisited segment) - `freiburg1_xyz`'s own point-count growth
+(35000+ points, local map staying at 2400-2700) is the more meaningful
+demonstration of bounded growth available in this repo's current dataset
+set. Per the issue's own instruction ("don't construct a synthetic revisit
+segment if this sequence doesn't happen to contain one - report that
+finding instead"): no revisit segment is reachable either, since tracking
+dies at 8.2% into the sequence. `NOTES.md`/#20's original long-sequence
+question remains untested, as #20 already anticipated.
+
+**Net result:** all three sub-issues (covisibility graph + metadata,
+Track Local Map hardening, local BA rescoping) implemented and landed in
+one branch per the issue's own "split further if needed" guidance (kept
+as one branch here since the performance-bug investigation made splitting
+into separate PRs impractical after the fact). Bounded local-map search
+is real and measured (point count stays flat as the map grows past 35k
+points) and recovers most of #21's tracking-loss regression on
+`freiburg1_xyz` (coverage 70.5% -> 87.9%), at the cost of a moderate ATE
+regression not further diagnosed here. `freiburg2_pioneer_slam2` remains
+unusable for this issue's own acceptance criteria for a pre-existing,
+already-documented reason unrelated to this issue's changes.
