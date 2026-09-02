@@ -704,3 +704,113 @@ points) and recovers most of #21's tracking-loss regression on
 regression not further diagnosed here. `freiburg2_pioneer_slam2` remains
 unusable for this issue's own acceptance criteria for a pre-existing,
 already-documented reason unrelated to this issue's changes.
+
+---
+
+## #24: New map point creation from all covisible keyframes (paper §VI-C)
+
+**Version:** `issue-24-new-point-creation-all-covisible` branch, on top of
+`main` post-#23 (`--depth-densify` not passed). Implements
+[#24](https://github.com/albinjanssonsand/slam/issues/24): the new-point-
+creation step in `pipeline/mapping.py`'s `_demo()` TRACK branch now searches
+every keyframe connected to the current one in the covisibility graph
+(`Map.covisible_keyframes`, capped to the 10 highest-shared-point neighbors,
+`--new-point-max-covisible-keyframes`), not just the single immediately-
+preceding reference keyframe. For each covisible keyframe: match this
+keyframe's still-unmatched ORB features against that keyframe's own still-
+unmatched features (`features.match_descriptors`), discard candidates that
+fail a new epipolar-constraint check between the two keyframes' already-
+solved poses (`--epipolar-max-error`, default 2px - no such check existed
+before, since there was previously only ever one candidate pair), and
+triangulate survivors (`triangulation.triangulate`, unchanged). After
+creation, each new point is additionally projected into every OTHER
+covisible keyframe it wasn't triangulated from and searched for a further
+correspondence, reusing `Map.match_against_guided` (§V-D Track Local Map
+projection/matching, from #23) rather than a separate search - each such
+match counts as an independent re-observation (`Map.confirm`), same as any
+other provisional point's confirming re-observation. New `Map.
+keyframe_matched_frame_idx`/`add_observation(..., frame_idx=)` track, per
+keyframe, which of its own ORB features are already tied to a map point, so
+the search doesn't spawn a duplicate point next to one a covisible keyframe
+already observes. Every keyframe's own ORB keypoints/descriptors are now
+kept for the life of the run (`keyframe_kp`/`keyframe_desc`, previously only
+the current reference keyframe's were retained), since the search needs to
+reach any covisible neighbor, not just the previous keyframe.
+
+**Reproduction:** same commands as the top of this file, run from this
+branch; outputs saved with a `covisible_newpoints_` prefix instead of
+`geometric_`/`guided_`.
+
+**New-point-creation rate (required by the issue) - points added per
+post-bootstrap keyframe, `freiburg1_xyz`:**
+
+| | Keyframes | Total map points | Points / post-bootstrap keyframe |
+|---|---|---|---|
+| Before (#23 baseline, single previous keyframe) | 372 | 59834 | 161.4 |
+| After (this issue, up to 10 covisible keyframes) | 418 | 112173 | 269.3 |
+
+**~1.67x more new structure created per keyframe**, consistent with the
+paper's richer candidate set (measured directly from the run log: keyframe
+promotions searched an average of 9.87 covisible keyframes each - the
+10-keyframe cap is nearly always saturated on this heavily-revisited scene -
+of which an average of 9.45 actually contributed at least one new point).
+
+**Map density/coverage (required by the issue), `freiburg1_xyz`:**
+
+| | Confirmed / total map points | Confirmed ratio |
+|---|---|---|
+| Before (#23 baseline) | 35662 / 59834 | 59.6% |
+| After (this issue) | 102768 / 112173 | 91.6% |
+
+Total map size grows 1.87x (59834 -> 112173), and the confirmed fraction
+jumps far more (2.88x confirmed count, 35662 -> 102768) - explained by the
+§VI-C last-paragraph projection step: a newly created point often picks up
+several independent re-observations from other covisible keyframes
+immediately at creation time (average 525.3 extra re-observations per
+keyframe promotion, from the run log), rather than waiting for a chance
+re-observation on some later frame the way the pre-existing provisional/
+confirmed lifecycle did.
+
+**freiburg1_xyz, full run:**
+
+| Sequence | Frames | Keyframes accepted | Confirmed / total map points | Trajectory coverage | ATE RMSE (m) | RPE RMSE (m) | Wall clock |
+|---|---|---|---|---|---|---|---|
+| `freiburg1_xyz` (baseline, #23's row) | 798 | 372 | 35662 / 59834 | 87.9% (26.4s / 30.1s) | 0.1425 | 0.0282 | ~11 min |
+| `freiburg1_xyz` (this issue) | 798 | 418 | 102768 / 112173 | 87.9% (26.4s / 30.1s) | 0.1516 | 0.0197 | ~17m45s |
+
+(`results/covisible_newpoints_xyz_vs_groundtruth.png` - the aligned estimate
+tracks ground truth's same diagonal back-and-forth sweep, the same
+qualitative shape as every other non-"too hard" `freiburg1_xyz` run in this
+file, not a tracking-loss scribble.)
+
+**Reading these numbers:** coverage is unchanged (87.9%, same to the tenth
+of a second) and only 3 of 798 frames lose tracking entirely - the richer
+search doesn't destabilize tracking. RPE (frame-to-frame local consistency)
+improves substantially, 0.0282m -> 0.0197m (-30%), consistent with local BA
+now having a much denser, better-connected covisibility neighborhood to
+constrain each keyframe against. **ATE gets slightly worse, 0.1425m ->
+0.1516m (+6.4%)**, reported honestly rather than glossed over - the same
+RPE-improves/ATE-worsens split #20 saw from full BA on this same sequence.
+Plausible explanation (not verified further, out of scope for this issue):
+this pipeline has no map-point culling/fusion yet (#26's territory, and
+explicitly deferred by #24's own scope to coordinate with that issue rather
+than assume today's lifecycle) - denser per-keyframe triangulation against
+many covisible keyframes plausibly creates more near-duplicate points
+representing the same physical surface at slightly different 3D positions
+than the old single-pair search did, which can locally over-constrain BA
+into a self-consistent-but-globally-biased solution without showing up in
+frame-to-frame RPE.
+
+**Performance cost (required by the issue):** wall clock grows ~1.6x (~11
+min -> ~17m45s) for the full 798-frame run - the added cost of matching
++ epipolar-checking against up to 10 covisible keyframes per promotion
+instead of 1, plus the extra `match_against_guided` projection pass per new
+point. Reported as measured, not optimized further - acceptable for this
+offline/batch pipeline per the issue's own performance note.
+
+**Net result:** §VI-C's richer candidate set delivers a clear, measured win
+on the issue's own primary acceptance criteria - 1.67x more new points per
+keyframe, 2.88x more confirmed points, no coverage or tracking-stability
+regression, and better RPE - at a measured ~1.6x wall-clock cost and a
+small ATE regression plausibly attributable to the still-missing point-
+culling/fusion step (#26), not to this issue's search logic itself.

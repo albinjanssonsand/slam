@@ -112,6 +112,15 @@ class Map:
         self._keyframe_points = {}
         self.covisibility_min_shared = covisibility_min_shared
 
+        # kf_idx -> set of that keyframe's own ORB feature indices already
+        # tied to a map point (across every observation ever registered for
+        # it) - lets §VI-C new-point search (see mapping._create_new_points_
+        # from_covisible_keyframes) restrict candidate correspondences in a
+        # covisible keyframe to its still-UNmatched features, so it doesn't
+        # spawn a duplicate point right next to one that keyframe already
+        # observes.
+        self._keyframe_matched_frame_idx = {}
+
     def __len__(self):
         return len(self.points)
 
@@ -144,7 +153,7 @@ class Map:
         become 'confirmed' once they've accumulated required_confirmations."""
         self.confirmation_count[indices] += 1
 
-    def add_observation(self, point_idx, kf_idx, camera_center, descriptor, octave):
+    def add_observation(self, point_idx, kf_idx, camera_center, descriptor, octave, frame_idx=None):
         """
         Register one new (keyframe, point) observation - called for every
         keyframe that observes a map point, whether that's the point's
@@ -158,6 +167,11 @@ class Map:
         its own observation list only, and the §III-D covisibility graph's
         edges to keyframes that already observe it - never a full
         recompute over the map's history.
+
+        frame_idx, if given, is kf_idx's own ORB feature index behind this
+        observation - recorded so keyframe_matched_frame_idx(kf_idx) can
+        later tell a §VI-C new-point search which of kf_idx's features are
+        already spoken for.
         """
         camera_center = np.asarray(camera_center, dtype=np.float64).ravel()
         # .copy(), not .asarray(): descriptor is typically a row-view into a
@@ -206,6 +220,14 @@ class Map:
             self._covisibility[other_kf][kf_idx] = self._covisibility[other_kf].get(kf_idx, 0) + 1
         observing_kfs.add(kf_idx)
         self._keyframe_points.setdefault(kf_idx, set()).add(point_idx)
+
+        if frame_idx is not None:
+            self._keyframe_matched_frame_idx.setdefault(kf_idx, set()).add(int(frame_idx))
+
+    def keyframe_matched_frame_idx(self, kf_idx):
+        """This keyframe's own ORB feature indices already tied to a map
+        point (via any observation ever registered with a frame_idx)."""
+        return set(self._keyframe_matched_frame_idx.get(kf_idx, ()))
 
     def covisible_keyframes(self, kf_idx, min_shared=None):
         """
@@ -792,6 +814,203 @@ def _keyframe_positions(keyframe_poses):
     ).reshape(-1, 3)
 
 
+def _fundamental_matrix(R1, t1, R2, t2, camera_matrix):
+    """Fundamental matrix between two ALREADY-KNOWN world-to-camera poses
+    (not estimated from correspondences, unlike pose.estimate_relative_pose)
+    - satisfies x2^T F x1 ~= 0 for a true correspondence (x1 in camera 1,
+    x2 in camera 2), used by _epipolar_line_distance to gate §VI-C
+    candidate correspondences before they're triangulated."""
+    R_rel = R2 @ R1.T
+    t_rel = (t2 - R_rel @ t1).ravel()
+    t_x = np.array([
+        [0, -t_rel[2], t_rel[1]],
+        [t_rel[2], 0, -t_rel[0]],
+        [-t_rel[1], t_rel[0], 0],
+    ])
+    E = t_x @ R_rel
+    K_inv = np.linalg.inv(camera_matrix)
+    return K_inv.T @ E @ K_inv
+
+
+def _epipolar_line_distance(F, pts1, pts2):
+    """Distance (px) from each pts2 point to the epipolar line F projects
+    its corresponding pts1 point onto - near zero for a true correspondence,
+    large for a false one (e.g. a repeated texture pattern matched to the
+    wrong instance of itself in another keyframe)."""
+    pts1_h = np.hstack([pts1, np.ones((len(pts1), 1))])
+    pts2_h = np.hstack([pts2, np.ones((len(pts2), 1))])
+    lines2 = pts1_h @ F.T
+    norm = np.sqrt(lines2[:, 0] ** 2 + lines2[:, 1] ** 2) + 1e-12
+    return np.abs(np.sum(lines2 * pts2_h, axis=1)) / norm
+
+
+def _covisible_candidates(sparse_map, kf_idx, fallback_kf_idx, max_keyframes):
+    """
+    Keyframes to search for §VI-C new-point correspondences against:
+    kf_idx's covisibility-graph neighbors, most-shared-points-first, capped
+    to max_keyframes. Falls back to including fallback_kf_idx (the
+    reference keyframe kf_idx was tracked against) if the graph doesn't
+    have edges for kf_idx yet crossing covisibility_min_shared - e.g. right
+    after bootstrap, before any keyframe pair has accumulated that many
+    shared points - mirroring local_map_keyframes' same fallback, so a
+    brand-new keyframe is never left with zero candidates to triangulate
+    against (today's single-previous-keyframe behavior, at minimum).
+    """
+    edges = sparse_map.covisible_keyframes(kf_idx)
+    ranked = sorted(edges, key=lambda k: edges[k], reverse=True)
+    if fallback_kf_idx != kf_idx and fallback_kf_idx not in ranked:
+        ranked = [fallback_kf_idx] + ranked
+    return ranked[:max_keyframes]
+
+
+def _create_new_points_from_covisible_keyframes(
+        sparse_map, new_kf_idx, R_new, t_new, kp_new, desc_new,
+        already_matched_frame_idx, covisible_candidates,
+        keyframe_poses, keyframe_kp, keyframe_desc, camera_matrix,
+        ratio, min_triangulation_angle, epipolar_max_error):
+    """
+    §VI-C new-point creation: for each of new_kf_idx's covisible keyframes
+    (covisible_candidates, most-shared-points-first, already capped by the
+    caller - see _covisible_candidates), match new_kf_idx's still-unmatched
+    ORB features against that keyframe's own still-unmatched features
+    (brute-force Hamming + ratio test, features.match_descriptors), discard
+    candidate correspondences that don't satisfy the epipolar constraint
+    between the two keyframes' already-solved poses, and triangulate the
+    survivors (triangulation.triangulate, unchanged - its cheirality/
+    parallax checks remain the acceptance criteria).
+
+    A new-keyframe feature already used for a point triangulated against one
+    covisible keyframe is excluded from candidate matching against the next
+    one, so the same feature can't spawn two different map points in a
+    single call.
+
+    Returns (point_ids, source_kf, source_pixels, new_kf_frame_idx,
+    new_kf_pixels) - five parallel lists, one entry per newly created point.
+    source_kf/source_pixels describe the COVISIBLE keyframe's side of each
+    point's founding observation (already registered here directly, since
+    that keyframe's index/pose/descriptors are already fully known);
+    new_kf_frame_idx/new_kf_pixels describe new_kf_idx's own side, left for
+    the caller to register alongside every other observation it makes
+    (matched, re-observed, and newly triangulated alike).
+    """
+    from pipeline.features import match_descriptors
+    from pipeline.triangulation import triangulate
+
+    point_ids, source_kf, source_pixels = [], [], []
+    new_kf_frame_idx, new_kf_pixels = [], []
+    claimed_new = set(already_matched_frame_idx)
+
+    for kf_i in covisible_candidates:
+        R_i, t_i, _ = keyframe_poses[kf_i]
+        kp_i, desc_i = keyframe_kp[kf_i], keyframe_desc[kf_i]
+        matched_i = sparse_map.keyframe_matched_frame_idx(kf_i)
+
+        free_new = np.array(
+            [i for i in range(len(kp_new)) if i not in claimed_new], dtype=int
+        )
+        free_i = np.array(
+            [i for i in range(len(kp_i)) if i not in matched_i], dtype=int
+        )
+        if len(free_new) == 0 or len(free_i) == 0:
+            continue
+
+        matches = match_descriptors(desc_new[free_new], desc_i[free_i], ratio)
+        if len(matches) == 0:
+            continue
+
+        q_idx = free_new[[m.queryIdx for m in matches]]
+        t_idx = free_i[[m.trainIdx for m in matches]]
+        pts_new = np.float32([kp_new[i].pt for i in q_idx])
+        pts_i = np.float32([kp_i[i].pt for i in t_idx])
+
+        F = _fundamental_matrix(R_i, t_i, R_new, t_new, camera_matrix)
+        epi_ok = _epipolar_line_distance(F, pts_i, pts_new) < epipolar_max_error
+        if not np.any(epi_ok):
+            continue
+        q_idx, t_idx = q_idx[epi_ok], t_idx[epi_ok]
+        pts_new, pts_i = pts_new[epi_ok], pts_i[epi_ok]
+
+        points_3d, valid, _, _ = triangulate(
+            R_i, t_i, R_new, t_new, camera_matrix, pts_i, pts_new,
+            min_parallax_deg=min_triangulation_angle,
+        )
+        if not np.any(valid):
+            continue
+
+        kept_q, kept_t = q_idx[valid], t_idx[valid]
+        kept_pts_new, kept_pts_i = pts_new[valid], pts_i[valid]
+        kept_points = points_3d[valid]
+
+        base_idx = len(sparse_map)
+        sparse_map.add_points(kept_points, desc_new[kept_q])
+        ids = list(range(base_idx, base_idx + len(kept_points)))
+
+        i_center = camera_center(R_i, t_i)
+        for pid, fidx_i in zip(ids, kept_t):
+            sparse_map.add_observation(
+                pid, kf_i, i_center, desc_i[int(fidx_i)], kp_i[int(fidx_i)].octave,
+                frame_idx=int(fidx_i),
+            )
+
+        point_ids.extend(ids)
+        source_kf.extend([kf_i] * len(ids))
+        source_pixels.extend((float(x), float(y)) for x, y in kept_pts_i)
+        new_kf_frame_idx.extend(int(f) for f in kept_q)
+        new_kf_pixels.extend((float(x), float(y)) for x, y in kept_pts_new)
+        claimed_new.update(int(f) for f in kept_q)
+
+    return point_ids, source_kf, source_pixels, new_kf_frame_idx, new_kf_pixels
+
+
+def _extend_new_points_to_other_covisible_keyframes(
+        sparse_map, point_ids, source_kf, covisible_candidates,
+        keyframe_poses, keyframe_kp, keyframe_desc, camera_matrix, window, ratio):
+    """
+    §VI-C last paragraph: project each just-created point into every
+    covisible keyframe OTHER than the one it was actually triangulated from
+    and search for a further correspondence, reusing
+    Map.match_against_guided's §V-D Track Local Map projection/matching
+    (viewing-angle/scale-invariance gating, octave-aware search radius)
+    rather than a separate search. Each match found is registered as an
+    independent re-observation (Map.confirm) - the same significance as any
+    other provisional point's confirming re-observation elsewhere in the
+    pipeline.
+
+    Returns the total number of extra observations found.
+    """
+    if not point_ids:
+        return 0
+
+    by_source = {}
+    for pid, kf in zip(point_ids, source_kf):
+        by_source.setdefault(kf, []).append(pid)
+
+    n_extra = 0
+    for kf_i, ids in by_source.items():
+        mask = np.zeros(len(sparse_map), dtype=bool)
+        mask[ids] = True
+        for kf_j in covisible_candidates:
+            if kf_j == kf_i:
+                continue
+            R_j, t_j, _ = keyframe_poses[kf_j]
+            kp_j, desc_j = keyframe_kp[kf_j], keyframe_desc[kf_j]
+            map_idx, frame_idx = sparse_map.match_against_guided(
+                kp_j, desc_j, camera_matrix, R_j, t_j, window=window, ratio=ratio, mask=mask,
+            )
+            if len(map_idx) == 0:
+                continue
+            j_center = camera_center(R_j, t_j)
+            for pid, fidx in zip(map_idx, frame_idx):
+                sparse_map.add_observation(
+                    pid, kf_j, j_center, desc_j[int(fidx)], kp_j[int(fidx)].octave,
+                    frame_idx=int(fidx),
+                )
+            sparse_map.confirm(map_idx)
+            n_extra += len(map_idx)
+
+    return n_extra
+
+
 def _demo():
     import argparse
 
@@ -855,6 +1074,17 @@ def _demo():
                          help="Minimum parallax angle (deg) between viewing rays to keep a "
                               "triangulated point - catches points thrown out to an "
                               "implausibly FAR depth (the 'sprinkler' artifact)")
+    parser.add_argument("--epipolar-max-error", type=float, default=2.0,
+                         help="Max distance (px) a §VI-C candidate correspondence's point may "
+                              "fall from its epipolar line (computed from the two keyframes' "
+                              "already-solved poses) before it's discarded, prior to "
+                              "triangulation - see mapping._epipolar_line_distance")
+    parser.add_argument("--new-point-max-covisible-keyframes", type=int, default=10,
+                         help="Cap on how many of a new keyframe's covisibility-graph "
+                              "neighbors (most shared points first) §VI-C new-point creation "
+                              "searches for correspondences against - bounds the added "
+                              "per-keyframe cost of matching+epipolar-checking against "
+                              "multiple keyframes instead of just the previous one")
     parser.add_argument("--confirm-reproj-error", type=float, default=4.0,
                          help="Max reprojection error (px) for a provisional point to count "
                               "as independently re-observed")
@@ -955,6 +1185,14 @@ def _demo():
     # rather than None, so --trajectory-output can't crash formatting it.
     keyframe_poses = [KeyframePose(R_pos, t_pos, 0.0)]
     keyframe_observations = [[]]
+    # keyframe_kp[i]/keyframe_desc[i]: the i-th keyframe's full ORB
+    # detection output (not just the subset tied to map points), kept for
+    # EVERY keyframe rather than just the current reference one - §VI-C new-
+    # point creation needs to search for correspondences against any of a
+    # new keyframe's covisible neighbors, not only the immediately
+    # preceding keyframe.
+    keyframe_kp = [None]
+    keyframe_desc = [None]
 
     ref_kp = None
     ref_desc = None
@@ -1014,6 +1252,7 @@ def _demo():
                 ref_R, ref_t = R_pos, t_pos
                 cur_pose_frame = frame.index
                 keyframe_poses[0] = KeyframePose(R_pos, t_pos, frame.timestamp)
+                keyframe_kp[0], keyframe_desc[0] = kp, desc
                 continue
 
             matches_ref = match_descriptors(ref_desc, desc, args.ratio)
@@ -1086,11 +1325,13 @@ def _demo():
                             cur_center = camera_center(R_new, t_new)
                             for pid, fidx in zip(new_ids, ref_frame_idx):
                                 sparse_map.add_observation(
-                                    pid, 0, ref_center, ref_desc[fidx], ref_kp[fidx].octave
+                                    pid, 0, ref_center, ref_desc[fidx], ref_kp[fidx].octave,
+                                    frame_idx=fidx,
                                 )
                             for pid, fidx in zip(new_ids, cur_frame_idx):
                                 sparse_map.add_observation(
-                                    pid, len(keyframe_poses), cur_center, desc[fidx], kp[fidx].octave
+                                    pid, len(keyframe_poses), cur_center, desc[fidx], kp[fidx].octave,
+                                    frame_idx=fidx,
                                 )
 
                             print(f"frame {frame.index}: BOOTSTRAP  parallax={parallax:.1f}px  "
@@ -1105,6 +1346,8 @@ def _demo():
                             R_pos, t_pos = R_new, t_new
                             cur_pose_frame = frame.index
                             keyframe_poses.append(KeyframePose(R_pos, t_pos, frame.timestamp))
+                            keyframe_kp.append(kp)
+                            keyframe_desc.append(desc)
                             if not args.no_ba and len(keyframe_poses) % args.ba_every == 0:
                                 ba_result = _run_local_ba(keyframe_poses, keyframe_observations,
                                                            sparse_map, K,
@@ -1235,7 +1478,13 @@ def _demo():
 
                             if has_ref_baseline and parallax >= args.min_parallax:
                                 # --- Promote to keyframe: confirm provisional
-                                # points, triangulate new structure, run BA ---
+                                # points, create new structure (§VI-C: searched
+                                # across every covisible keyframe, not just the
+                                # previous one - see _create_new_points_from_
+                                # covisible_keyframes), run BA ---
+                                new_kf_idx = len(keyframe_poses)
+                                new_center = camera_center(R_pos, t_pos)
+
                                 this_kf_observations = [
                                     (int(idx), float(x), float(y))
                                     for idx, (x, y) in zip(
@@ -1249,6 +1498,18 @@ def _demo():
                                 # descriptor/pyramid octave once the full list (matched +
                                 # re-observed + newly triangulated) is assembled.
                                 this_kf_frame_idx = frame_indices[pnp_inlier_mask].tolist()
+
+                                # Register this keyframe's observations of already-
+                                # existing map points FIRST, before anything else - the
+                                # §VI-C new-point search below needs the covisibility
+                                # graph to already carry real edges for new_kf_idx (built
+                                # from exactly these shared-point observations) so it
+                                # knows which keyframes are actually its neighbors.
+                                for (pid, x, y), fidx in zip(this_kf_observations, this_kf_frame_idx):
+                                    sparse_map.add_observation(
+                                        pid, new_kf_idx, new_center, desc[fidx], kp[fidx].octave,
+                                        frame_idx=fidx,
+                                    )
 
                                 # Now that the pose is trustworthy (confirmed points
                                 # only), check provisional points for independent
@@ -1269,83 +1530,91 @@ def _demo():
                                     errors = np.linalg.norm(proj - prov_pixels, axis=1)
                                     good = errors < args.confirm_reproj_error
                                     reobserved_idx = prov_map_idx[good]
+                                    reobserved_frame_idx = prov_frame_idx[good]
+                                    reobserved_pixels = prov_pixels[good]
                                     sparse_map.confirm(reobserved_idx)
+                                    for pid, fidx, (x, y) in zip(
+                                        reobserved_idx, reobserved_frame_idx, reobserved_pixels
+                                    ):
+                                        sparse_map.add_observation(
+                                            pid, new_kf_idx, new_center, desc[int(fidx)],
+                                            kp[int(fidx)].octave, frame_idx=int(fidx),
+                                        )
                                     this_kf_observations.extend(
                                         (int(idx), float(x), float(y))
-                                        for idx, (x, y) in zip(reobserved_idx, prov_pixels[good])
+                                        for idx, (x, y) in zip(reobserved_idx, reobserved_pixels)
                                     )
-                                    this_kf_frame_idx.extend(prov_frame_idx[good].tolist())
+                                    this_kf_frame_idx.extend(reobserved_frame_idx.tolist())
                                     n_reobserved = int(good.sum())
 
-                                # Triangulate new points from pairs not already tied to
-                                # an existing map point (confirmed or provisional),
-                                # using this frame's just-solved (map-scale-consistent)
-                                # pose.
-                                already_in_map = set(frame_indices.tolist()) | set(prov_frame_idx.tolist())
-                                new_mask = np.array(
-                                    [m.trainIdx not in already_in_map for m in matches_ref]
+                                # §VI-C: search for new-point correspondences across
+                                # EVERY keyframe connected to this one in the
+                                # covisibility graph (not just the immediately
+                                # preceding one). Excludes, on this keyframe's side,
+                                # features already tied to an existing map point
+                                # (matched or re-observed above); each covisible
+                                # keyframe's own already-matched features are excluded
+                                # on its side inside the helper itself.
+                                already_matched_frame_idx = (
+                                    set(frame_indices.tolist()) | set(prov_frame_idx.tolist())
                                 )
-                                candidates = [m for m, keep in zip(matches_ref, new_mask) if keep]
-
-                                new_count = 0
-                                if len(candidates) >= 8:
-                                    # pts1/pts2 are ref-keyframe/current-frame pixel pairs
-                                    # (from matches_ref) - triangulate against the
-                                    # REFERENCE keyframe's own pose (ref_R/ref_t), not
-                                    # R_pos/t_pos, which by this point already equals
-                                    # R_new/t_new (updated above for every tracked frame,
-                                    # not just keyframes) and would give a zero-baseline,
-                                    # degenerate triangulation against itself.
-                                    new_points, valid, in_front, parallax_deg = triangulate(
-                                        ref_R, ref_t, R_new, t_new, K,
-                                        pts1[new_mask], pts2[new_mask],
-                                        min_parallax_deg=args.min_triangulation_angle,
+                                covisible_candidates = _covisible_candidates(
+                                    sparse_map, new_kf_idx, ref_kf_idx,
+                                    args.new_point_max_covisible_keyframes,
+                                )
+                                (new_point_ids, new_source_kf, new_source_pixels,
+                                 new_kf_frame_idx_new, new_kf_pixels_new) = (
+                                    _create_new_points_from_covisible_keyframes(
+                                        sparse_map, new_kf_idx, R_new, t_new, kp, desc,
+                                        already_matched_frame_idx, covisible_candidates,
+                                        keyframe_poses, keyframe_kp, keyframe_desc, K,
+                                        args.ratio, args.min_triangulation_angle,
+                                        args.epipolar_max_error,
                                     )
-                                    kept = [m for m, keep in zip(candidates, valid) if keep]
-                                    new_desc = desc[[m.trainIdx for m in kept]]
+                                )
+                                new_count = len(new_point_ids)
 
-                                    base_idx = len(sparse_map)
-                                    sparse_map.add_points(new_points[valid], new_desc)
-                                    new_ids = list(range(base_idx, base_idx + int(valid.sum())))
-                                    obs_ref = pts1[new_mask][valid]
-                                    obs_cur = pts2[new_mask][valid]
-                                    keyframe_observations[-1].extend(
-                                        (pid, x, y) for pid, (x, y) in zip(new_ids, obs_ref)
+                                # Each new point's covisible-keyframe-side observation
+                                # was already registered inside the helper above; register
+                                # its OTHER side (this new keyframe's own observation)
+                                # and this keyframe's raw pixel record for BA.
+                                for pid, kf_i, (xi, yi) in zip(new_point_ids, new_source_kf, new_source_pixels):
+                                    keyframe_observations[kf_i].append((pid, xi, yi))
+                                for pid, fidx, (x, y) in zip(new_point_ids, new_kf_frame_idx_new, new_kf_pixels_new):
+                                    sparse_map.add_observation(
+                                        pid, new_kf_idx, new_center, desc[fidx], kp[fidx].octave,
+                                        frame_idx=fidx,
                                     )
-                                    this_kf_observations.extend(
-                                        (pid, x, y) for pid, (x, y) in zip(new_ids, obs_cur)
-                                    )
-                                    new_count = int(valid.sum())
+                                this_kf_observations.extend(
+                                    (pid, x, y) for pid, (x, y) in zip(new_point_ids, new_kf_pixels_new)
+                                )
+                                this_kf_frame_idx.extend(new_kf_frame_idx_new)
 
-                                    # §III-C/III-D bookkeeping for these new points' REF-
-                                    # keyframe observation - their current-keyframe
-                                    # observation is registered below alongside every other
-                                    # observation this keyframe makes.
-                                    ref_frame_idx_new = [m.queryIdx for m in kept]
-                                    this_kf_frame_idx.extend(m.trainIdx for m in kept)
-                                    ref_center = camera_center(ref_R, ref_t)
-                                    for pid, fidx in zip(new_ids, ref_frame_idx_new):
-                                        sparse_map.add_observation(
-                                            pid, ref_kf_idx, ref_center, ref_desc[fidx], ref_kp[fidx].octave
-                                        )
+                                # §VI-C last paragraph: project each just-created point
+                                # into the covisible keyframes it WASN'T triangulated
+                                # from and search for a further correspondence there too
+                                # - reuses match_against_guided (§V-D Track Local Map)
+                                # rather than a separate search. Each additional match
+                                # counts as an independent re-observation, same as a
+                                # provisional point's confirming re-observation above.
+                                n_extra_obs = _extend_new_points_to_other_covisible_keyframes(
+                                    sparse_map, new_point_ids, new_source_kf, covisible_candidates,
+                                    keyframe_poses, keyframe_kp, keyframe_desc, K,
+                                    args.guided_window, args.ratio,
+                                )
 
                                 print(f"frame {frame.index}: KEYFRAME  parallax={parallax:.1f}px  "
                                       f"rotation={rot_deg:.1f}deg  "
                                       f"{pnp_inliers}/{len(map_indices)} PnP inliers, "
-                                      f"{new_count} new (provisional) points, "
+                                      f"{new_count} new (provisional) points from "
+                                      f"{len(set(new_source_kf))}/{len(covisible_candidates)} covisible "
+                                      f"keyframes searched, {n_extra_obs} extra re-observations, "
                                       f"{n_reobserved} re-observed "
                                       f"({sparse_map.n_confirmed} confirmed / {len(sparse_map)} total)")
 
-                                # §III-C/III-D bookkeeping: this keyframe's observation of
-                                # every point in this_kf_observations (matched, re-observed,
-                                # and newly triangulated alike) - new points' OTHER (ref-
-                                # keyframe) observation was already registered above.
-                                new_kf_idx = len(keyframe_poses)
-                                new_center = camera_center(R_pos, t_pos)
-                                for (pid, x, y), fidx in zip(this_kf_observations, this_kf_frame_idx):
-                                    sparse_map.add_observation(pid, new_kf_idx, new_center, desc[fidx], kp[fidx].octave)
-
                                 keyframe_poses.append(KeyframePose(R_pos, t_pos, frame.timestamp))
+                                keyframe_kp.append(kp)
+                                keyframe_desc.append(desc)
                                 keyframe_observations.append(this_kf_observations)
                                 if not args.no_ba and len(keyframe_poses) % args.ba_every == 0:
                                     ba_result = _run_local_ba(keyframe_poses, keyframe_observations,
