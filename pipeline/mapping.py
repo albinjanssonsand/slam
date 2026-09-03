@@ -1027,7 +1027,8 @@ def _demo():
     parser = argparse.ArgumentParser(
         description="Bootstrap a sparse map once, then track pose every frame via "
                      "motion-predicted guided PnP against it, inserting a keyframe "
-                     "(triangulation/confirmation/BA) only once parallax accumulates"
+                     "(triangulation/confirmation/BA) once the paper's own §V-E "
+                     "multi-condition policy says one is needed"
     )
     parser.add_argument("--video", required=True,
                          help="Video file path, integer device index, or image-sequence folder "
@@ -1040,11 +1041,36 @@ def _demo():
                               "feature budget and starve other regions (e.g. the background)")
     parser.add_argument("--ratio", type=float, default=0.75, help="Lowe's ratio test threshold")
     parser.add_argument("--min-parallax", type=float, default=10.0,
-                         help="Minimum median pixel displacement vs the reference keyframe "
-                              "before this frame's tracked pose is also inserted as a new "
-                              "keyframe (triangulation/confirmation/BA) - does not gate "
-                              "whether a pose is estimated at all; every frame attempts "
-                              "motion-predicted guided PnP against the map (px)")
+                         help="Minimum median pixel displacement vs the reference frame "
+                              "before bootstrap accepts a two-view essential-matrix pose - "
+                              "avoids the degenerate/ill-conditioned solve pure-rotation "
+                              "motion produces. Does not gate TRACK-branch keyframe "
+                              "promotion (that's --kf-* below, the paper's own §V-E policy - "
+                              "an earlier version of this pipeline also required this here, "
+                              "but measured worse on every metric; see EVALUATION_RESULTS.md) "
+                              "or whether a pose is estimated at all once tracking a map (px)")
+    parser.add_argument("--kf-min-tracked-points", type=int, default=50,
+                         help="Paper §V-E condition: minimum PnP-tracked confirmed map "
+                              "points a frame must have before it can be promoted to a "
+                              "keyframe")
+    parser.add_argument("--kf-ref-ratio", type=float, default=0.9,
+                         help="Paper §V-E condition: promote a frame to a keyframe only "
+                              "if it tracks fewer than this fraction of the map points "
+                              "the current reference keyframe itself tracked via PnP when "
+                              "it was inserted (vacuously satisfied until the reference "
+                              "keyframe is itself a PnP-tracked one, e.g. right after "
+                              "bootstrap)")
+    parser.add_argument("--kf-min-frames-since-relocalization", type=int, default=20,
+                         help="Paper §V-E condition: only promote a keyframe more than "
+                              "this many frames after the last global relocalization - "
+                              "always satisfied today, since relocalization (#13) doesn't "
+                              "exist yet in this pipeline")
+    parser.add_argument("--kf-max-frames-since-keyframe", type=int, default=20,
+                         help="Force a keyframe insertion (bypassing every other §V-E "
+                              "condition) after this many frames with none accepted - "
+                              "stands in for the paper's "
+                              "'local mapping idle' condition, which has no meaning here "
+                              "since there's no separate mapping thread")
     parser.add_argument("--guided-window", type=float, default=60.0,
                          help="Pixel radius around each confirmed map point's motion-"
                               "predicted projection to search for a descriptor match "
@@ -1229,6 +1255,24 @@ def _demo():
     ref_kf_idx = 0
     last_tracked_map_indices = None
 
+    # Paper §V-E new-keyframe policy state (TRACK branch only - bootstrap
+    # keeps its own unconditional parallax-gated promotion). frames_since_
+    # last_keyframe drives the max-frames fallback that stands in for the
+    # paper's "local mapping idle" condition (no separate mapping thread
+    # here - see --kf-max-frames-since-keyframe). frames_since_relocalization
+    # drives condition 1 - there's no relocalization in this pipeline yet
+    # (#13), so it starts with a head start large enough that the condition
+    # is always satisfied; #13 can wire in a real reset-on-relocalization
+    # event later without reworking this policy. ref_kf_tracked_count is
+    # how many map points the current reference keyframe itself tracked via
+    # PnP when it was inserted (condition 4's baseline) - None for a
+    # bootstrap-created reference keyframe, which never ran PnP against a
+    # prior map, so condition 4 is vacuously satisfied until a real
+    # PnP-tracked keyframe becomes the reference.
+    frames_since_last_keyframe = 0
+    frames_since_relocalization = 10**9
+    ref_kf_tracked_count = None
+
     # --depth-densify state: an ML depth model, run only at accepted keyframes
     # (not every frame - keyframes are already sparse). ml_points is purely
     # for visual sanity-checking (see below) - never fed into sparse_map.
@@ -1255,11 +1299,15 @@ def _demo():
                 keyframe_kp[0], keyframe_desc[0] = kp, desc
                 continue
 
+            frames_since_last_keyframe += 1
+            frames_since_relocalization += 1
+
             matches_ref = match_descriptors(ref_desc, desc, args.ratio)
 
             status = "insufficient matches"
             parallax = 0.0
             is_keyframe = False
+            pnp_inliers = None
             pts1 = pts2 = np.empty((0, 2), dtype=np.float32)
             has_ref_baseline = len(matches_ref) >= 8
             if has_ref_baseline:
@@ -1365,9 +1413,10 @@ def _demo():
                 # --- Track: motion-predicted guided PnP against the map,
                 # attempted every frame (confirmed points only - provisional
                 # points must never influence the pose that could end up
-                # confirming them). --min-parallax no longer gates whether a
-                # pose is estimated at all - only whether this frame's
-                # tracked pose *also* gets promoted to a keyframe, below. ---
+                # confirming them). --min-parallax plays no role here at all -
+                # it only gates bootstrap's essential-matrix estimation above;
+                # whether this frame's tracked pose *also* gets promoted to a
+                # keyframe is decided purely by the §V-E policy below. ---
                 track_accepted = False
                 if (
                     prev_pose is not None
@@ -1476,7 +1525,52 @@ def _demo():
                             R_pos, t_pos = R_new, t_new
                             cur_pose_frame = frame.index
 
-                            if has_ref_baseline and parallax >= args.min_parallax:
+                            # Paper §V-E new-keyframe policy: the max-frames
+                            # fallback forces promotion regardless of the other
+                            # three conditions (standing in for "local mapping
+                            # idle" - no separate mapping thread here); otherwise
+                            # all of "long enough since relocalization" (#13, a
+                            # no-op today), "tracks enough map points", and
+                            # "tracks meaningfully less than the reference
+                            # keyframe did" must hold. Deliberately NO separate
+                            # --min-parallax requirement on top here - the paper
+                            # doesn't have one either: CreateNewMapPoints' own
+                            # per-point parallax-angle rejection (this
+                            # codebase's equivalent: triangulate's
+                            # min_parallax_deg, already running per covisible-
+                            # keyframe pair since #24) is what actually protects
+                            # triangulation, not a whole-frame proxy at the
+                            # keyframe-decision level. An earlier version of
+                            # this policy kept --min-parallax as an extra gate
+                            # here "to be safe"; measured directly on
+                            # freiburg1_xyz (#25's own required evaluation, see
+                            # EVALUATION_RESULTS.md's ablation), that gate was
+                            # actively counterproductive - dropping it improved
+                            # ATE (-17%), RPE (-14%), AND more than halved full
+                            # tracking-loss frames (77->36/798), because it
+                            # blocked refreshing a stale reference keyframe
+                            # exactly when condition 4 said tracking had
+                            # degraded for reasons unrelated to translation
+                            # (blur, lighting, slow rotation) - working against
+                            # §V-E's own aggressive-insertion-for-robustness
+                            # intent.
+                            kf_max_frames_reached = (
+                                frames_since_last_keyframe >= args.kf_max_frames_since_keyframe
+                            )
+                            kf_since_reloc_ok = (
+                                frames_since_relocalization
+                                > args.kf_min_frames_since_relocalization
+                            )
+                            kf_min_tracked_ok = pnp_inliers >= args.kf_min_tracked_points
+                            kf_ref_ratio_ok = (
+                                ref_kf_tracked_count is None
+                                or pnp_inliers < args.kf_ref_ratio * ref_kf_tracked_count
+                            )
+                            kf_policy_ok = kf_max_frames_reached or (
+                                kf_since_reloc_ok and kf_min_tracked_ok and kf_ref_ratio_ok
+                            )
+
+                            if has_ref_baseline and kf_policy_ok:
                                 # --- Promote to keyframe: confirm provisional
                                 # points, create new structure (§VI-C: searched
                                 # across every covisible keyframe, not just the
@@ -1603,9 +1697,14 @@ def _demo():
                                     args.guided_window, args.ratio,
                                 )
 
+                                kf_trigger = (
+                                    "max-frames-fallback" if kf_max_frames_reached
+                                    else "paper-conditions"
+                                )
                                 print(f"frame {frame.index}: KEYFRAME  parallax={parallax:.1f}px  "
                                       f"rotation={rot_deg:.1f}deg  "
                                       f"{pnp_inliers}/{len(map_indices)} PnP inliers, "
+                                      f"trigger={kf_trigger}  "
                                       f"{new_count} new (provisional) points from "
                                       f"{len(set(new_source_kf))}/{len(covisible_candidates)} covisible "
                                       f"keyframes searched, {n_extra_obs} extra re-observations, "
@@ -1726,6 +1825,12 @@ def _demo():
                 ref_kp, ref_desc, ref_image = kp, desc, frame.image
                 ref_R, ref_t = R_pos, t_pos
                 ref_kf_idx = len(keyframe_poses) - 1
+                frames_since_last_keyframe = 0
+                # None for a bootstrap-created keyframe (pnp_inliers stays
+                # None all frame - no PnP was run against a prior map), which
+                # keeps condition 4 vacuously satisfied until a real
+                # PnP-tracked keyframe becomes the reference.
+                ref_kf_tracked_count = pnp_inliers
             else:
                 n_skipped += 1
 
