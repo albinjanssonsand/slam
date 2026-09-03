@@ -249,12 +249,12 @@ class Map:
         """
         Ongoing §VI-B rule for points that already passed the initial
         three-keyframe test: remove any that have since dropped below three
-        observing keyframes (e.g. via future keyframe culling or bundle
-        adjustment marking observations as outliers - neither exists in
-        this pipeline yet, so this is a no-op today; the rule itself is
-        implemented so those can plug into it later without touching this
-        method). Call once per keyframe insertion. Returns the removed
-        point indices.
+        observing keyframes - since #33, reachable via bundle adjustment
+        marking an observation an outlier (mapping._discard_ba_outlier_
+        observations calls Map.remove_observation, then this) as well as
+        future keyframe culling (#27). Call once per keyframe insertion (and
+        again after any BA pass that may have discarded observations).
+        Returns the removed point indices.
         """
         elapsed = current_kf_idx - self.created_kf
         candidates = np.where(self.active & (elapsed > 3))[0]
@@ -291,32 +291,7 @@ class Map:
         descriptor = np.array(descriptor, dtype=np.uint8, copy=True)
         obs = self._observations[point_idx]
         obs.append((kf_idx, camera_center, descriptor, int(octave), frame_idx))
-
-        # Viewing direction: mean unit vector, observing camera center ->
-        # point, across every observation (§III-C) - deliberately NOT
-        # renormalized to unit length afterward (matches the paper: a
-        # point observed from widely diverging angles ends up with a
-        # shorter mean vector, which is exactly what makes the viewing-
-        # angle gate v.n < cos(60 deg) meaningful downstream).
-        point = self.points[point_idx]
-        rays = np.array([point - o[1] for o in obs])
-        unit_rays = rays / np.maximum(np.linalg.norm(rays, axis=1, keepdims=True), 1e-9)
-        self.viewing_direction[point_idx] = unit_rays.mean(axis=0)
-
-        # Scale-invariance bounds: derived from THIS (latest) observation's
-        # distance and pyramid octave only, matching the paper's own
-        # incremental update - not an aggregate over the point's whole
-        # observation history.
-        dist = max(float(np.linalg.norm(point - camera_center)), 1e-9)
-        level_scale = self.pyramid_scale_factor ** octave
-        self.d_max[point_idx] = dist * level_scale
-        self.d_min[point_idx] = self.d_max[point_idx] / (
-            self.pyramid_scale_factor ** (self.pyramid_n_levels - 1)
-        )
-
-        # Representative descriptor: recomputed over every observation.
-        descs = np.array([o[2] for o in obs])
-        self.descriptors[point_idx] = _representative_descriptor(descs)
+        self._recompute_point_metadata(point_idx)
 
         # Covisibility graph: this point is now newly shared between
         # kf_idx and every other keyframe that already observed it, so
@@ -332,6 +307,106 @@ class Map:
 
         if frame_idx is not None:
             self._keyframe_matched_frame_idx.setdefault(kf_idx, set()).add(int(frame_idx))
+
+    def _recompute_point_metadata(self, point_idx):
+        """
+        Shared by add_observation (after appending a new observation) and
+        remove_observation (after popping a discarded one) - viewing
+        direction and representative descriptor are full recomputes over
+        whatever observations now remain (§III-C); the scale-invariance
+        bounds stay keyed off the most recent (last) remaining observation
+        only, matching add_observation's original incremental convention -
+        not an aggregate over the point's whole history. No-op if no
+        observations remain (the caller - remove_observation, via
+        cull_low_observation_points - is responsible for then removing a
+        point left with too few observing keyframes; stale metadata on a
+        point with zero observations is otherwise harmless since it's
+        already excluded from every match/local-map/BA query).
+        """
+        obs = self._observations[point_idx]
+        if not obs:
+            return
+        point = self.points[point_idx]
+
+        # Deliberately NOT renormalized to unit length afterward (matches
+        # the paper: a point observed from widely diverging angles ends up
+        # with a shorter mean vector, which is exactly what makes the
+        # viewing-angle gate v.n < cos(60 deg) meaningful downstream).
+        rays = np.array([point - o[1] for o in obs])
+        unit_rays = rays / np.maximum(np.linalg.norm(rays, axis=1, keepdims=True), 1e-9)
+        self.viewing_direction[point_idx] = unit_rays.mean(axis=0)
+
+        _, last_center, _, last_octave, _ = obs[-1]
+        dist = max(float(np.linalg.norm(point - last_center)), 1e-9)
+        level_scale = self.pyramid_scale_factor ** last_octave
+        self.d_max[point_idx] = dist * level_scale
+        self.d_min[point_idx] = self.d_max[point_idx] / (
+            self.pyramid_scale_factor ** (self.pyramid_n_levels - 1)
+        )
+
+        descs = np.array([o[2] for o in obs])
+        self.descriptors[point_idx] = _representative_descriptor(descs)
+
+    def remove_observation(self, point_idx, kf_idx):
+        """
+        Undo one earlier add_observation(point_idx, kf_idx, ...) call - e.g.
+        an observation bundle adjustment has just marked as an outlier
+        (§VI-D). Unlike remove_points, the point itself is NOT removed
+        outright for merely dropping below 3 observing keyframes - that
+        age-gated check is cull_low_observation_points's job, left to the
+        caller (this method never calls it). No-op if point_idx has no
+        recorded observation from kf_idx.
+
+        The one exception: a point left with ZERO observations is removed
+        immediately, unconditionally (via remove_points, safe to call here -
+        every observation was already popped one at a time above, so its
+        own cleanup work is all already done and it only sets `removed`).
+        This can't wait for cull_low_observation_points/cull_new_points,
+        both of which are gated on elapsed-since-creation and can leave a
+        point that lost every observation in the very keyframe it was
+        created in - e.g. both of a just-triangulated point's founding
+        observations flagged outliers in the same BA call - sitting
+        `active` with stale (pre-removal) viewing-direction/scale-invariance
+        metadata and eligible for guided matching until some later
+        keyframe's age-gated check catches it, if one ever does before the
+        point's index simply never gets re-observed.
+
+        Mirrors add_observation's bookkeeping in reverse: drops the
+        observation itself, frees its (keyframe, ORB feature index) slot
+        (see remove_points for why that matters), decrements the
+        covisibility edge between kf_idx and every OTHER keyframe still
+        observing this point (the edge weight is exactly the number of
+        shared points - one fewer are now shared with kf_idx specifically,
+        not with each other), and recomputes the point's §III-C metadata
+        from its remaining observations only.
+        """
+        obs = self._observations[point_idx]
+        match_i = next((i for i, o in enumerate(obs) if o[0] == kf_idx), None)
+        if match_i is None:
+            return
+        _, _, _, _, obs_frame_idx = obs.pop(match_i)
+        if obs_frame_idx is not None:
+            self._keyframe_matched_frame_idx.get(kf_idx, set()).discard(int(obs_frame_idx))
+
+        other_kfs = self._point_keyframes[point_idx]
+        other_kfs.discard(kf_idx)
+        self._keyframe_points.get(kf_idx, set()).discard(point_idx)
+
+        for other in other_kfs:
+            if self._covisibility.get(kf_idx, {}).get(other):
+                self._covisibility[kf_idx][other] -= 1
+                if self._covisibility[kf_idx][other] <= 0:
+                    del self._covisibility[kf_idx][other]
+            if self._covisibility.get(other, {}).get(kf_idx):
+                self._covisibility[other][kf_idx] -= 1
+                if self._covisibility[other][kf_idx] <= 0:
+                    del self._covisibility[other][kf_idx]
+
+        if not other_kfs:
+            self.remove_points([point_idx])
+            return
+
+        self._recompute_point_metadata(point_idx)
 
     def keyframe_matched_frame_idx(self, kf_idx):
         """This keyframe's own ORB feature indices already tied to a map
@@ -355,6 +430,24 @@ class Map:
     def observing_keyframes(self, point_idx):
         """Keyframe indices that have observed this point."""
         return set(self._point_keyframes[point_idx])
+
+    def observation_octave(self, point_idx, kf_idx):
+        """
+        The ORB pyramid octave kf_idx's observation of this point was
+        detected at, or None if kf_idx never observed it. Used by BA's
+        outlier chi-squared threshold (_run_ba/local_bundle_adjustment) to
+        scale the bound by each observation's own detection-scale
+        uncertainty - the same principle triangulate()'s reprojection-error
+        check already applies (a coarser pyramid level is less precisely
+        localized in original-image pixels, so it's allowed a
+        proportionally larger reprojection error before being flagged an
+        outlier) - rather than one flat threshold that's implicitly only
+        calibrated for octave 0.
+        """
+        for obs_kf, _, _, octave, _ in self._observations[point_idx]:
+            if obs_kf == kf_idx:
+                return octave
+        return None
 
     def n_observing_keyframes(self, point_idx):
         """Number of distinct keyframes that have observed this point - O(1),
@@ -555,7 +648,8 @@ def estimate_pose_pnp(object_points, image_points, camera_matrix):
 
 
 def _run_ba(keyframe_poses, keyframe_observations, sparse_map, camera_matrix,
-            free_kfs, fixed_kfs, point_ids, max_points, max_nfev, ftol, xtol):
+            free_kfs, fixed_kfs, point_ids, max_points, max_nfev, ftol, xtol,
+            outlier_chi2_threshold=5.991):
     """
     Shared BA plumbing for both _run_local_ba (§VI-D covisibility-scoped)
     and _run_global_ba (whole-trajectory-scoped): given an already-chosen
@@ -570,10 +664,15 @@ def _run_ba(keyframe_poses, keyframe_observations, sparse_map, camera_matrix,
 
     Returns None if there wasn't enough data for a meaningful refinement,
     otherwise (free_kf_indices, refined_rotations, refined_translations,
-    point_ids, refined_points) - free_kf_indices[i] is the GLOBAL keyframe
-    index refined_rotations[i]/refined_translations[i] belongs to (sorted
-    ascending, so free_kf_indices[-1] is always the most recent one -
-    fixed keyframes' poses are never returned, since they don't change).
+    point_ids, refined_points, outlier_observations) - free_kf_indices[i] is
+    the GLOBAL keyframe index refined_rotations[i]/refined_translations[i]
+    belongs to (sorted ascending, so free_kf_indices[-1] is always the most
+    recent one - fixed keyframes' poses are never returned, since they don't
+    change). outlier_observations (§VI-D) is a list of (kf_idx, point_idx) -
+    both GLOBAL ids - marking every observation local_bundle_adjustment
+    classified an outlier; NOT yet removed from sparse_map/
+    keyframe_observations (see _discard_ba_outlier_observations, called by
+    _validate_and_apply_ba only once the result is accepted).
 
     If point_ids has more than max_points points (common right after a
     keyframe that added a lot of new structure at once), only the most
@@ -612,22 +711,37 @@ def _run_ba(keyframe_poses, keyframe_observations, sparse_map, camera_matrix,
     id_to_local = {pid: i for i, pid in enumerate(point_ids)}
     local_points = sparse_map.points[point_ids].copy()
 
-    local_observations = [
-        (kf_to_local[kf], id_to_local[pid], x, y)
-        for kf in all_kfs
-        for pid, x, y in keyframe_observations[kf]
-        if pid in point_id_set
-    ]
+    local_observations = []
+    local_octaves = []
+    for kf in all_kfs:
+        for pid, x, y in keyframe_observations[kf]:
+            if pid not in point_id_set:
+                continue
+            local_observations.append((kf_to_local[kf], id_to_local[pid], x, y))
+            # Falls back to octave 0 (the tightest bound) only if the
+            # (kf, pid) pair is somehow missing from the Map's own
+            # observation list - shouldn't normally happen, since every
+            # keyframe_observations entry is registered via add_observation
+            # alongside the exact same (kf, pid) pair.
+            octave = sparse_map.observation_octave(pid, kf)
+            local_octaves.append(0 if octave is None else octave)
     if len(local_observations) < 10:
         return None
 
     rotations = [keyframe_poses[k].R for k in all_kfs]
     translations = [keyframe_poses[k].t for k in all_kfs]
 
-    refined_rot, refined_trans, refined_pts = local_bundle_adjustment(
+    refined_rot, refined_trans, refined_pts, outlier_local = local_bundle_adjustment(
         rotations, translations, local_points, local_observations, camera_matrix,
         fixed_poses=fixed_mask, max_nfev=max_nfev, ftol=ftol, xtol=xtol,
+        outlier_chi2_threshold=outlier_chi2_threshold,
+        observation_octaves=local_octaves,
+        pyramid_scale_factor=sparse_map.pyramid_scale_factor,
     )
+    outlier_observations = [
+        (all_kfs[local_observations[i][0]], point_ids[local_observations[i][1]])
+        for i in outlier_local
+    ]
 
     free_lookup = set(free_kfs)
     free_kf_indices = [kf for kf in all_kfs if kf in free_lookup]
@@ -635,11 +749,13 @@ def _run_ba(keyframe_poses, keyframe_observations, sparse_map, camera_matrix,
     free_refined_rot = [refined_by_kf[kf][0] for kf in free_kf_indices]
     free_refined_trans = [refined_by_kf[kf][1] for kf in free_kf_indices]
 
-    return free_kf_indices, free_refined_rot, free_refined_trans, point_ids, refined_pts
+    return (free_kf_indices, free_refined_rot, free_refined_trans, point_ids,
+            refined_pts, outlier_observations)
 
 
 def _run_local_ba(keyframe_poses, keyframe_observations, sparse_map, camera_matrix,
-                   max_points=300, max_nfev=1000, ftol=1e-4, xtol=1e-4):
+                   max_points=300, max_nfev=1000, ftol=1e-4, xtol=1e-4,
+                   outlier_chi2_threshold=5.991):
     """
     Refine the current (most recently accepted) keyframe's covisibility-
     scoped local BA window (§VI-D): free keyframes Kl = the current
@@ -691,11 +807,12 @@ def _run_local_ba(keyframe_poses, keyframe_observations, sparse_map, camera_matr
 
     return _run_ba(keyframe_poses, keyframe_observations, sparse_map, camera_matrix,
                     sorted(local_kfs), sorted(fixed_kfs), point_ids,
-                    max_points, max_nfev, ftol, xtol)
+                    max_points, max_nfev, ftol, xtol,
+                    outlier_chi2_threshold=outlier_chi2_threshold)
 
 
 def _run_global_ba(keyframe_poses, keyframe_observations, sparse_map, camera_matrix,
-                    max_nfev=8000, ftol=1e-6, xtol=1e-6):
+                    max_nfev=8000, ftol=1e-6, xtol=1e-6, outlier_chi2_threshold=5.991):
     """
     Full BA (paper Appendix; used offline in §VIII-E/Table VI): every
     keyframe (except keyframe 0, held fixed as the sole gauge anchor) and
@@ -729,7 +846,8 @@ def _run_global_ba(keyframe_poses, keyframe_observations, sparse_map, camera_mat
     )
     return _run_ba(keyframe_poses, keyframe_observations, sparse_map, camera_matrix,
                     free_kfs, fixed_kfs, point_ids, max_points=None,
-                    max_nfev=max_nfev, ftol=ftol, xtol=xtol)
+                    max_nfev=max_nfev, ftol=ftol, xtol=xtol,
+                    outlier_chi2_threshold=outlier_chi2_threshold)
 
 
 def _reprojection_error_stats(keyframe_poses, keyframe_observations, sparse_map, camera_matrix):
@@ -765,14 +883,56 @@ def _reprojection_error_stats(keyframe_poses, keyframe_observations, sparse_map,
 
 
 def _apply_ba_result(keyframe_poses, sparse_map, ba_result):
-    free_kf_indices, refined_rot, refined_trans, point_ids, refined_pts = ba_result
+    free_kf_indices, refined_rot, refined_trans, point_ids, refined_pts, _ = ba_result
     for kf_idx, R_ref, t_ref in zip(free_kf_indices, refined_rot, refined_trans):
         keyframe_poses[kf_idx] = keyframe_poses[kf_idx]._replace(R=R_ref, t=t_ref)
     sparse_map.points[point_ids] = refined_pts
 
 
-def _validate_and_apply_ba(ba_result, keyframe_poses, sparse_map, recent_step_sizes,
-                            fallback_R, fallback_t, max_plausible_rotation, max_step_ratio):
+def _discard_ba_outlier_observations(keyframe_observations, sparse_map, outlier_observations):
+    """
+    §VI-D: physically remove observations bundle adjustment has just marked
+    outliers - from the Map's own bookkeeping (Map.remove_observation, which
+    updates the covisibility graph and each point's observing-keyframe count)
+    and from the flat keyframe_observations list BA itself reads its input
+    from (Map.remove_observation only touches the Map's own state - same
+    keyframe_observations/Map split _run_global_ba already has to work
+    around for culled points, see its own comment).
+
+    outlier_observations: list of (kf_idx, point_idx) GLOBAL-id pairs (as
+    returned by _run_ba - see its docstring). Returns (n_discarded,
+    n_points_removed_immediately) - n_discarded is the number of
+    observations actually discarded (deduplicated first - a pair appearing
+    more than once, which shouldn't normally happen, is only discarded
+    once); n_points_removed_immediately counts points Map.remove_observation
+    itself removed outright for dropping to zero observations (its own
+    unconditional exception to the normal age-gated <3-observing-keyframe
+    rule - see its docstring) - the caller still needs to run
+    cull_low_observation_points afterward for the (much more common) case
+    of a point merely dropping below 3, which this count does NOT include.
+    """
+    outlier_pairs = set(outlier_observations)
+    by_kf = {}
+    for kf_idx, point_idx in outlier_pairs:
+        by_kf.setdefault(kf_idx, set()).add(point_idx)
+
+    for kf_idx, point_ids in by_kf.items():
+        keyframe_observations[kf_idx] = [
+            o for o in keyframe_observations[kf_idx] if o[0] not in point_ids
+        ]
+    n_removed_immediately = 0
+    for kf_idx, point_idx in outlier_pairs:
+        was_active = not sparse_map.removed[point_idx]
+        sparse_map.remove_observation(point_idx, kf_idx)
+        if was_active and sparse_map.removed[point_idx]:
+            n_removed_immediately += 1
+
+    return len(outlier_pairs), n_removed_immediately
+
+
+def _validate_and_apply_ba(ba_result, keyframe_poses, keyframe_observations, sparse_map,
+                            recent_step_sizes, fallback_R, fallback_t,
+                            max_plausible_rotation, max_step_ratio, current_kf_idx):
     """
     Apply a proposed BA refinement only if EVERY pose in the window still
     passes the same rotation/step plausibility checks used for a fresh PnP
@@ -796,16 +956,29 @@ def _validate_and_apply_ba(ba_result, keyframe_poses, sparse_map, recent_step_si
     args.max_plausible_rotation/args.max_step_ratio unchanged; the
     global-BA call site passes its own, looser thresholds.
 
-    Returns the (R, t) pose to use going forward: the BA-refined latest pose
-    if the whole window is accepted, otherwise fallback_R/fallback_t (the
-    pre-BA pose) with nothing in keyframe_poses/sparse_map touched at all.
+    current_kf_idx: passed straight through to Map.cull_low_observation_points
+    once outlier observations (if any) are discarded (§VI-D feeding §VI-B's
+    ongoing rule, see _discard_ba_outlier_observations) - the current/most
+    recent keyframe for a local-BA call site, or the last keyframe for the
+    one-shot global-BA call site.
+
+    Returns (R, t, n_outliers_discarded, n_points_culled) - R/t are the
+    BA-refined latest pose if the whole window is accepted, otherwise
+    fallback_R/fallback_t (the pre-BA pose) with nothing in keyframe_poses/
+    sparse_map/keyframe_observations touched at all (n_outliers_discarded/
+    n_points_culled are then always 0 too - a rejected result's outlier
+    classification is never trusted either, since it came from a solve
+    whose own geometry was just rejected as implausible). The last two are
+    for the caller to accumulate into a run-wide total (§VI-D's required
+    reporting - see _demo's total_ba_outliers_discarded/
+    total_culled_from_ba_outliers).
     """
     from pipeline.pose import rotation_angle_deg
 
     if ba_result is None:
-        return fallback_R, fallback_t
+        return fallback_R, fallback_t, 0, 0
 
-    free_kf_indices, refined_rot, refined_trans, _, _ = ba_result
+    free_kf_indices, refined_rot, refined_trans, _, _, outlier_observations = ba_result
 
     for kf_idx, new_R, new_t in zip(free_kf_indices, refined_rot, refined_trans):
         old_R, old_t, _ = keyframe_poses[kf_idx]
@@ -820,12 +993,25 @@ def _validate_and_apply_ba(ba_result, keyframe_poses, sparse_map, recent_step_si
         if implausible:
             print(f"    [BA result rejected: implausible pose change at keyframe {kf_idx} "
                   f"(rotation={rot_change:.1f}deg, step={step_change:.2f})]")
-            return fallback_R, fallback_t
+            return fallback_R, fallback_t, 0, 0
 
     new_R, new_t = refined_rot[-1], refined_trans[-1]
 
     _apply_ba_result(keyframe_poses, sparse_map, ba_result)
-    return new_R, new_t
+
+    n_discarded, n_culled = 0, 0
+    if outlier_observations:
+        n_discarded, n_removed_immediately = _discard_ba_outlier_observations(
+            keyframe_observations, sparse_map, outlier_observations
+        )
+        culled = sparse_map.cull_low_observation_points(current_kf_idx)
+        n_culled = len(culled) + n_removed_immediately
+        print(f"    [BA outlier discard: {n_discarded} observations removed, "
+              f"{n_culled} point(s) removed as a result "
+              f"({n_removed_immediately} dropped to zero observations, "
+              f"{len(culled)} dropped below 3 observing keyframes)]")
+
+    return new_R, new_t, n_discarded, n_culled
 
 
 def _run_depth_densify(frame_image, R_pos, t_pos, sparse_map, map_indices, image_points,
@@ -1007,7 +1193,8 @@ def _create_new_points_from_covisible_keyframes(
         sparse_map, new_kf_idx, R_new, t_new, kp_new, desc_new,
         already_matched_frame_idx, covisible_candidates,
         keyframe_poses, keyframe_kp, keyframe_desc, camera_matrix,
-        ratio, min_triangulation_angle, epipolar_max_error):
+        ratio, min_triangulation_angle, epipolar_max_error,
+        triangulation_max_reproj_chi2, triangulation_scale_ratio_factor):
     """
     §VI-C new-point creation: for each of new_kf_idx's covisible keyframes
     (covisible_candidates, most-shared-points-first, already capped by the
@@ -1016,8 +1203,9 @@ def _create_new_points_from_covisible_keyframes(
     (brute-force Hamming + ratio test, features.match_descriptors), discard
     candidate correspondences that don't satisfy the epipolar constraint
     between the two keyframes' already-solved poses, and triangulate the
-    survivors (triangulation.triangulate, unchanged - its cheirality/
-    parallax checks remain the acceptance criteria).
+    survivors (triangulation.triangulate - cheirality/parallax plus, since
+    #33, reprojection-error/scale-consistency remain the acceptance
+    criteria).
 
     A new-keyframe feature already used for a point triangulated against one
     covisible keyframe is excluded from candidate matching against the next
@@ -1070,9 +1258,15 @@ def _create_new_points_from_covisible_keyframes(
         q_idx, t_idx = q_idx[epi_ok], t_idx[epi_ok]
         pts_new, pts_i = pts_new[epi_ok], pts_i[epi_ok]
 
+        octave_i = np.array([kp_i[i].octave for i in t_idx])
+        octave_new = np.array([kp_new[i].octave for i in q_idx])
         points_3d, valid, _, _ = triangulate(
             R_i, t_i, R_new, t_new, camera_matrix, pts_i, pts_new,
             min_parallax_deg=min_triangulation_angle,
+            octave1=octave_i, octave2=octave_new,
+            pyramid_scale_factor=sparse_map.pyramid_scale_factor,
+            max_reproj_chi2=triangulation_max_reproj_chi2,
+            max_scale_ratio_factor=triangulation_scale_ratio_factor,
         )
         if not np.any(valid):
             continue
@@ -1244,6 +1438,21 @@ def _demo():
                               "fall from its epipolar line (computed from the two keyframes' "
                               "already-solved poses) before it's discarded, prior to "
                               "triangulation - see mapping._epipolar_line_distance")
+    parser.add_argument("--triangulation-max-reproj-chi2", type=float, default=5.991,
+                         help="Paper §VI-C triangulation acceptance test: reject a candidate "
+                              "point if its reprojection error in either originating keyframe "
+                              "exceeds this chi-squared bound (2-DOF, default 5.991 = 95 "
+                              "percent confidence - ORB-SLAM2's own default), scaled by that "
+                              "keyframe's detection-octave variance - see "
+                              "triangulation.triangulate")
+    parser.add_argument("--triangulation-scale-ratio-factor", type=float, default=1.5,
+                         help="Paper §VI-C triangulation acceptance test: reject a candidate "
+                              "point if the ratio of its distance to each originating keyframe "
+                              "is inconsistent (beyond this tolerance factor, itself scaled by "
+                              "one more pyramid scale factor - matching ORB-SLAM2) with the "
+                              "ratio of the two keyframes' pyramid scale factors at the octaves "
+                              "each keypoint was actually detected at - see "
+                              "triangulation.triangulate")
     parser.add_argument("--new-point-max-covisible-keyframes", type=int, default=10,
                          help="Cap on how many of a new keyframe's covisibility-graph "
                               "neighbors (most shared points first) §VI-C new-point creation "
@@ -1269,6 +1478,15 @@ def _demo():
                               "BA call refines (keeps the most recently added ones if exceeded)")
     parser.add_argument("--no-ba", action="store_true",
                          help="Disable local bundle adjustment (for comparison)")
+    parser.add_argument("--ba-outlier-chi2", type=float, default=5.991,
+                         help="Paper §VI-D: 'observations that are marked as outliers are "
+                              "discarded at the middle and at the end of the optimization'. "
+                              "Squared-reprojection-error (px^2) chi-squared bound (default "
+                              "5.991 = 95 percent confidence, 2 DOF - ORB-SLAM2's own default) used by "
+                              "both local and global BA to classify and discard outlier "
+                              "observations, which then feeds Map.cull_low_observation_points "
+                              "(§VI-B's ongoing rule, see bundle_adjustment.local_bundle_"
+                              "adjustment/mapping._discard_ba_outlier_observations)")
     parser.add_argument("--global-ba-at-end", action="store_true",
                          help="After tracking completes, run one full bundle adjustment pass "
                               "over every keyframe and every map point (paper Appendix; offline "
@@ -1381,6 +1599,12 @@ def _demo():
     # §VI-B culling totals across the whole run, for the final report.
     total_culled_trial = 0
     total_culled_ongoing = 0
+    # §VI-D BA outlier-observation discarding totals (#33) - total_culled_
+    # from_ba_outliers is the specific slice of total_culled_ongoing (points
+    # dropped below 3 observing keyframes) attributable to this trigger,
+    # tracked separately since it's the first trigger that can ever fire it.
+    total_ba_outliers_discarded = 0
+    total_culled_from_ba_outliers = 0
 
     # §V-D Track Local Map state: ref_kf_idx is the keyframe index backing
     # ref_kp/ref_desc/ref_R/ref_t (kept in lockstep with them below);
@@ -1472,10 +1696,20 @@ def _demo():
                             R_new, t_new = compose_pose(R_pos, t_pos, R_rel, t_rel)
                             inlier_mask = mask_pose.ravel().astype(bool)
 
+                            octave1 = np.array(
+                                [ref_kp[m.queryIdx].octave for m in matches_ref]
+                            )[inlier_mask]
+                            octave2 = np.array(
+                                [kp[m.trainIdx].octave for m in matches_ref]
+                            )[inlier_mask]
                             new_points, valid, in_front, parallax_deg = triangulate(
                                 R_pos, t_pos, R_new, t_new, K,
                                 pts1[inlier_mask], pts2[inlier_mask],
                                 min_parallax_deg=args.min_triangulation_angle,
+                                octave1=octave1, octave2=octave2,
+                                pyramid_scale_factor=sparse_map.pyramid_scale_factor,
+                                max_reproj_chi2=args.triangulation_max_reproj_chi2,
+                                max_scale_ratio_factor=args.triangulation_scale_ratio_factor,
                             )
                             kept_matches = [m for m, keep in zip(matches_ref, inlier_mask) if keep]
                             kept_matches = [m for m, keep in zip(kept_matches, valid) if keep]
@@ -1534,14 +1768,19 @@ def _demo():
                             total_culled_trial += len(culled_trial)
                             total_culled_ongoing += len(culled_ongoing)
                             if not args.no_ba and len(keyframe_poses) % args.ba_every == 0:
-                                ba_result = _run_local_ba(keyframe_poses, keyframe_observations,
-                                                           sparse_map, K,
-                                                           max_points=args.ba_max_points)
-                                R_pos, t_pos = _validate_and_apply_ba(
-                                    ba_result, keyframe_poses, sparse_map,
+                                ba_result = _run_local_ba(
+                                    keyframe_poses, keyframe_observations, sparse_map, K,
+                                    max_points=args.ba_max_points,
+                                    outlier_chi2_threshold=args.ba_outlier_chi2,
+                                )
+                                R_pos, t_pos, n_ba_outliers, n_ba_culled = _validate_and_apply_ba(
+                                    ba_result, keyframe_poses, keyframe_observations, sparse_map,
                                     recent_step_sizes, R_pos, t_pos,
                                     args.max_plausible_rotation, args.max_step_ratio,
+                                    new_kf_idx,
                                 )
+                                total_ba_outliers_discarded += n_ba_outliers
+                                total_culled_from_ba_outliers += n_ba_culled
                             n_keyframes += 1
                             is_keyframe = True
                             status = f"BOOTSTRAP ({int(valid.sum())} points seeded)"
@@ -1772,6 +2011,8 @@ def _demo():
                                         keyframe_poses, keyframe_kp, keyframe_desc, K,
                                         args.ratio, args.min_triangulation_angle,
                                         args.epipolar_max_error,
+                                        args.triangulation_max_reproj_chi2,
+                                        args.triangulation_scale_ratio_factor,
                                     )
                                 )
                                 new_count = len(new_point_ids)
@@ -1833,14 +2074,19 @@ def _demo():
                                       f"({sparse_map.n_active} active / {len(sparse_map)} total "
                                       f"map points)]")
                                 if not args.no_ba and len(keyframe_poses) % args.ba_every == 0:
-                                    ba_result = _run_local_ba(keyframe_poses, keyframe_observations,
-                                                               sparse_map, K,
-                                                               max_points=args.ba_max_points)
-                                    R_pos, t_pos = _validate_and_apply_ba(
-                                        ba_result, keyframe_poses, sparse_map,
+                                    ba_result = _run_local_ba(
+                                        keyframe_poses, keyframe_observations, sparse_map, K,
+                                        max_points=args.ba_max_points,
+                                        outlier_chi2_threshold=args.ba_outlier_chi2,
+                                    )
+                                    R_pos, t_pos, n_ba_outliers, n_ba_culled = _validate_and_apply_ba(
+                                        ba_result, keyframe_poses, keyframe_observations, sparse_map,
                                         recent_step_sizes, R_pos, t_pos,
                                         args.max_plausible_rotation, args.max_step_ratio,
+                                        new_kf_idx,
                                     )
+                                    total_ba_outliers_discarded += n_ba_outliers
+                                    total_culled_from_ba_outliers += n_ba_culled
 
                                 if args.depth_densify:
                                     if depth_rows is None:
@@ -1960,6 +2206,10 @@ def _demo():
           f"{n_skipped} frames not promoted to a keyframe "
           f"({n_tracked_only} still tracked frame-only, "
           f"{n_skipped - n_tracked_only} lost tracking entirely)")
+    print(f"    [BA outlier discard (paper VI-D): {total_ba_outliers_discarded} observations "
+          f"discarded across all BA passes, {total_culled_from_ba_outliers} point(s) removed "
+          f"by the ongoing <3-observing-keyframe rule as a direct result - previously "
+          f"unreachable from any trigger (see #26/#33)]")
     if args.depth_densify:
         print(f"{len(ml_points)} ML-depth points sampled (sanity-check plot only - "
               f"not part of the tracked map)")
@@ -1978,17 +2228,21 @@ def _demo():
                 keyframe_poses, keyframe_observations, sparse_map, K,
                 max_nfev=args.global_ba_max_nfev,
                 ftol=args.global_ba_ftol, xtol=args.global_ba_xtol,
+                outlier_chi2_threshold=args.ba_outlier_chi2,
             )
             elapsed = time.perf_counter() - t0
             if ba_result is None:
                 print(f"[global BA: skipped in {elapsed:.1f}s - fewer than 10 map points "
                       f"observed across the trajectory]")
             else:
-                _validate_and_apply_ba(
-                    ba_result, keyframe_poses, sparse_map, recent_step_sizes,
-                    keyframe_poses[-1].R, keyframe_poses[-1].t,
+                _, _, n_ba_outliers, n_ba_culled = _validate_and_apply_ba(
+                    ba_result, keyframe_poses, keyframe_observations, sparse_map,
+                    recent_step_sizes, keyframe_poses[-1].R, keyframe_poses[-1].t,
                     args.global_ba_max_plausible_rotation, args.global_ba_max_step_ratio,
+                    len(keyframe_poses) - 1,
                 )
+                total_ba_outliers_discarded += n_ba_outliers
+                total_culled_from_ba_outliers += n_ba_culled
                 after_stats = _reprojection_error_stats(
                     keyframe_poses, keyframe_observations, sparse_map, K
                 )
