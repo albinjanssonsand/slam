@@ -58,25 +58,39 @@ class Map:
     """A growing set of 3D points, each tied to the ORB descriptor of its most
     recent observation so future frames can be matched against it directly.
 
-    New points start out unconfirmed ("provisional"): a whole batch of new
-    points triangulated from a single two-view pair all share that one pair's
-    pose estimate, so if that pose has any systematic error, every point in
-    the batch inherits the same bias - no per-point sanity filter (parallax
-    angle, depth-vs-baseline) can catch this, since the batch can look
-    perfectly self-consistent internally while still being collectively
-    wrong. Provisional points are excluded from PnP pose estimation until
-    they've accumulated `required_confirmations` independent re-observations
-    (see `confirm`), so a bad batch can't influence the pose that would
-    otherwise confirm its own siblings, and a single lucky coincidental
-    reprojection isn't enough on its own to promote a point.
+    Every point is usable for PnP/guided matching/BA from the moment it's
+    created - there's no separate provisional/confirmed admission gate.
+    Instead, a point is removed outright if it fails the paper's Recent Map
+    Points Culling test (§VI-B): checked only during its first three
+    keyframes after creation, a point is removed if it's found by tracking
+    in at most 25% of the frames it was predicted visible in, or - once more
+    than one keyframe has passed since its creation - if it hasn't been
+    observed from at least three keyframes (see `cull_new_points`). Once a
+    point survives that window, it's only removed later if its observing-
+    keyframe count drops below three for some other reason (e.g. future
+    keyframe culling or BA marking observations as outliers - see
+    `cull_low_observation_points`). Removed points are excluded from every
+    match/local-map/BA query (via `active`/`remove_points`) but their rows
+    are never physically deleted, since point indices are used as stable
+    identifiers everywhere else (keyframe_observations, BA point ids).
     """
 
-    def __init__(self, required_confirmations=2, pyramid_scale_factor=1.2,
-                 pyramid_n_levels=8, covisibility_min_shared=15):
+    def __init__(self, pyramid_scale_factor=1.2, pyramid_n_levels=8,
+                 covisibility_min_shared=15):
         self.points = np.empty((0, 3), dtype=np.float64)
         self.descriptors = np.empty((0, 32), dtype=np.uint8)
-        self.confirmation_count = np.empty(0, dtype=np.int32)
-        self.required_confirmations = required_confirmations
+
+        # §VI-B Recent Map Points Culling bookkeeping: the keyframe a point
+        # was created at, how many frames predicted it visible (projected
+        # in front, within the frame, passing the viewing-angle/scale-
+        # invariance gates) versus how many actually found/matched it
+        # (record_visible/record_found - called every frame from guided
+        # Track Local Map matching), and whether it's been removed
+        # (cull_new_points/cull_low_observation_points/remove_points).
+        self.created_kf = np.empty(0, dtype=np.int64)
+        self.n_visible = np.empty(0, dtype=np.int64)
+        self.n_found = np.empty(0, dtype=np.int64)
+        self.removed = np.empty(0, dtype=bool)
 
         # Per-point metadata (§III-C): viewing direction (mean unit vector,
         # observing-camera-center -> point) and the scale-invariance
@@ -125,42 +139,137 @@ class Map:
         return len(self.points)
 
     @property
-    def confirmed(self):
-        return self.confirmation_count >= self.required_confirmations
+    def active(self):
+        """Points still in the map (not yet removed by §VI-B culling)."""
+        return ~self.removed
 
     @property
-    def n_confirmed(self):
-        return int(self.confirmed.sum())
+    def n_active(self):
+        return int(self.active.sum())
 
-    def add_points(self, points_3d, descriptors, confirmed=False):
+    def add_points(self, points_3d, descriptors, created_kf):
+        """created_kf: the keyframe index these points are being created at -
+        §VI-B's culling window is measured relative to it."""
         if len(points_3d) == 0:
             return
         n = len(points_3d)
         self.points = np.vstack([self.points, points_3d])
         self.descriptors = np.vstack([self.descriptors, descriptors])
-        initial_count = self.required_confirmations if confirmed else 0
-        self.confirmation_count = np.concatenate(
-            [self.confirmation_count, np.full(n, initial_count, dtype=np.int32)]
+        self.created_kf = np.concatenate(
+            [self.created_kf, np.full(n, created_kf, dtype=np.int64)]
         )
+        self.n_visible = np.concatenate([self.n_visible, np.zeros(n, dtype=np.int64)])
+        self.n_found = np.concatenate([self.n_found, np.zeros(n, dtype=np.int64)])
+        self.removed = np.concatenate([self.removed, np.zeros(n, dtype=bool)])
         self.viewing_direction = np.vstack([self.viewing_direction, np.zeros((n, 3))])
         self.d_min = np.concatenate([self.d_min, np.zeros(n)])
         self.d_max = np.concatenate([self.d_max, np.zeros(n)])
         self._observations.extend([] for _ in range(n))
         self._point_keyframes.extend(set() for _ in range(n))
 
-    def confirm(self, indices):
-        """Register one independent re-observation for these points - they
-        become 'confirmed' once they've accumulated required_confirmations."""
-        self.confirmation_count[indices] += 1
+    def record_visible(self, indices):
+        """Register that these points were predicted visible (projected in
+        front of the camera, within the frame, passing the viewing-angle/
+        scale-invariance gates) in the current frame - §VI-B's found/
+        predicted-visible ratio denominator."""
+        if len(indices) == 0:
+            return
+        np.add.at(self.n_visible, indices, 1)
+
+    def record_found(self, indices):
+        """Register that these points were actually matched by tracking in
+        the current frame - §VI-B's found/predicted-visible ratio numerator."""
+        if len(indices) == 0:
+            return
+        np.add.at(self.n_found, indices, 1)
+
+    def remove_points(self, indices):
+        """
+        Permanently remove these points from the map (§VI-B culling):
+        dropped from every keyframe's observed-point set and the
+        covisibility graph's edge weights, which excludes them from every
+        future match_against/match_against_guided/local-map/BA query (all
+        derive their candidate set from _keyframe_points/_point_keyframes).
+        self.points/self.descriptors rows are left in place - point indices
+        are used as stable identifiers everywhere else (keyframe_
+        observations, BA point ids), so nothing is ever reindexed.
+        """
+        indices = [int(i) for i in indices if not self.removed[i]]
+        if not indices:
+            return
+        self.removed[indices] = True
+        for idx in indices:
+            kfs = list(self._point_keyframes[idx])
+            for kf in kfs:
+                self._keyframe_points.get(kf, set()).discard(idx)
+            for a in range(len(kfs)):
+                for b in range(a + 1, len(kfs)):
+                    k1, k2 = kfs[a], kfs[b]
+                    if self._covisibility.get(k1, {}).get(k2):
+                        self._covisibility[k1][k2] -= 1
+                        if self._covisibility[k1][k2] <= 0:
+                            del self._covisibility[k1][k2]
+                    if self._covisibility.get(k2, {}).get(k1):
+                        self._covisibility[k2][k1] -= 1
+                        if self._covisibility[k2][k1] <= 0:
+                            del self._covisibility[k2][k1]
+            self._point_keyframes[idx] = set()
+            # Free each observation's (keyframe, ORB feature index) slot
+            # back up too - otherwise a covisible keyframe's feature that
+            # only ever founded this now-removed point would stay flagged
+            # "already matched" forever, permanently blocking any future
+            # §VI-C search from spawning a replacement point there.
+            for obs_kf, _, _, _, obs_frame_idx in self._observations[idx]:
+                if obs_frame_idx is not None:
+                    self._keyframe_matched_frame_idx.get(obs_kf, set()).discard(int(obs_frame_idx))
+
+    def cull_new_points(self, current_kf_idx):
+        """
+        §VI-B Recent Map Points Culling, checked only during a point's first
+        three keyframes after creation: remove it if its found/predicted-
+        visible ratio is <= 25%, or - once more than one keyframe has passed
+        since its creation - if it hasn't been observed from at least three
+        keyframes. Call once per keyframe insertion, with that keyframe's
+        own index. Returns the removed point indices.
+        """
+        elapsed = current_kf_idx - self.created_kf
+        candidates = np.where(self.active & (elapsed >= 1) & (elapsed <= 3))[0]
+        removed = []
+        for idx in candidates:
+            idx = int(idx)
+            ratio = self.n_found[idx] / self.n_visible[idx] if self.n_visible[idx] > 0 else 0.0
+            fails_ratio = ratio <= 0.25
+            fails_observations = elapsed[idx] > 1 and self.n_observing_keyframes(idx) < 3
+            if fails_ratio or fails_observations:
+                removed.append(idx)
+        self.remove_points(removed)
+        return removed
+
+    def cull_low_observation_points(self, current_kf_idx):
+        """
+        Ongoing §VI-B rule for points that already passed the initial
+        three-keyframe test: remove any that have since dropped below three
+        observing keyframes (e.g. via future keyframe culling or bundle
+        adjustment marking observations as outliers - neither exists in
+        this pipeline yet, so this is a no-op today; the rule itself is
+        implemented so those can plug into it later without touching this
+        method). Call once per keyframe insertion. Returns the removed
+        point indices.
+        """
+        elapsed = current_kf_idx - self.created_kf
+        candidates = np.where(self.active & (elapsed > 3))[0]
+        removed = [int(idx) for idx in candidates if self.n_observing_keyframes(idx) < 3]
+        self.remove_points(removed)
+        return removed
 
     def add_observation(self, point_idx, kf_idx, camera_center, descriptor, octave, frame_idx=None):
         """
         Register one new (keyframe, point) observation - called for every
         keyframe that observes a map point, whether that's the point's
         initial triangulation (two observations: the reference and current
-        keyframe of the pair it was triangulated from), a provisional
-        point's confirming re-observation, or an already-confirmed point
-        matched again by ordinary per-keyframe PnP tracking.
+        keyframe of the pair it was triangulated from), a further founding
+        observation from another covisible keyframe, or an already-existing
+        point matched again by ordinary per-keyframe PnP tracking.
 
         Incrementally updates this point's §III-C metadata (viewing
         direction, scale-invariance bounds, representative descriptor) from
@@ -181,7 +290,7 @@ class Map:
         # kept, for every observation ever registered.
         descriptor = np.array(descriptor, dtype=np.uint8, copy=True)
         obs = self._observations[point_idx]
-        obs.append((kf_idx, camera_center, descriptor, int(octave)))
+        obs.append((kf_idx, camera_center, descriptor, int(octave), frame_idx))
 
         # Viewing direction: mean unit vector, observing camera center ->
         # point, across every observation (§III-C) - deliberately NOT
@@ -247,6 +356,11 @@ class Map:
         """Keyframe indices that have observed this point."""
         return set(self._point_keyframes[point_idx])
 
+    def n_observing_keyframes(self, point_idx):
+        """Number of distinct keyframes that have observed this point - O(1),
+        the direct-query form §VI-B's culling rules need every keyframe."""
+        return len(self._point_keyframes[point_idx])
+
     def local_map_keyframes(self, seed_points, max_keyframes=30):
         """
         K1 union K2 (§V-D "Track Local Map"): K1 is every keyframe that
@@ -291,15 +405,17 @@ class Map:
 
     def match_against(self, desc, ratio=0.75, mask=None):
         """
-        Match frame descriptors against a subset of the map (all points by
-        default, or a boolean mask over self.points - e.g. self.confirmed,
-        or ~self.confirmed to check provisional points specifically).
-        Returns (map_indices, frame_indices) - map_indices are original
-        (stable) indices, not positions within the subset.
+        Match frame descriptors against a subset of the map (every active -
+        not yet §VI-B-culled - point by default, or a boolean mask over
+        self.points, always further restricted to active points regardless
+        of what mask is passed). Returns (map_indices, frame_indices) -
+        map_indices are original (stable) indices, not positions within the
+        subset.
         """
         from pipeline.features import match_descriptors
 
-        subset = np.where(mask)[0] if mask is not None else np.arange(len(self))
+        subset_mask = self.active if mask is None else (mask & self.active)
+        subset = np.where(subset_mask)[0]
         if len(subset) == 0 or desc is None or len(desc) == 0:
             return np.empty(0, dtype=int), np.empty(0, dtype=int)
 
@@ -309,38 +425,44 @@ class Map:
         return map_indices, frame_indices
 
     def match_against_guided(self, kp, desc, camera_matrix, R_pred, t_pred,
-                              window=25.0, ratio=0.75, mask=None):
+                              window=25.0, ratio=0.75, mask=None, image_shape=None):
         """
         Guided variant of match_against, following the paper's §V-D "Track
         Local Map" projection sequence rather than a flat pixel window: for
         each candidate map point (subset - normally the local map, K1 union
-        K2, see local_map_keyframes/local_map_points, not the whole
-        confirmed map), project it into the frame with the predicted pose
-        and discard it if it's behind the camera, if its viewing angle
-        against the point's stored §III-C viewing direction exceeds 60 deg,
-        or if its predicted distance falls outside the point's stored
-        [d_min, d_max] scale-invariance range. Every point still standing
-        predicts the ORB pyramid octave it should now appear at (the
-        paper's PredictScale, derived from d_max and how much the distance
-        has changed since the point's own reference observation) - this
-        sets both the candidate search radius (scaled by that octave's
-        pyramid downsampling factor, so a point predicted at a coarser
-        level searches a wider pixel radius) and an octave tolerance band
-        ([predicted-1, predicted+1]) candidate frame keypoints must fall
-        within, on top of the existing spatial+ratio-test narrowing.
+        K2, see local_map_keyframes/local_map_points, always further
+        restricted to active - not yet §VI-B-culled - points), project it
+        into the frame with the predicted pose and discard it if it's behind
+        the camera, if its viewing angle against the point's stored §III-C
+        viewing direction exceeds 60 deg, if its predicted distance falls
+        outside the point's stored [d_min, d_max] scale-invariance range, or
+        (only when image_shape - (height, width) - is given) if it projects
+        outside the frame. Every point still standing predicts the ORB
+        pyramid octave it should now appear at (the paper's PredictScale,
+        derived from d_max and how much the distance has changed since the
+        point's own reference observation) - this sets both the candidate
+        search radius (scaled by that octave's pyramid downsampling factor,
+        so a point predicted at a coarser level searches a wider pixel
+        radius) and an octave tolerance band ([predicted-1, predicted+1])
+        candidate frame keypoints must fall within, on top of the existing
+        spatial+ratio-test narrowing.
 
-        A point projecting outside the frame simply finds no real keypoint
-        nearby and contributes no match - there's no separate explicit
-        bounds check.
+        Without image_shape, a point projecting outside the frame simply
+        finds no real keypoint nearby and contributes no match - there's no
+        separate bounds check in that case.
 
-        Returns (map_indices, frame_indices), same convention as
-        match_against.
+        Returns (map_indices, frame_indices, visible_indices) - map_indices/
+        frame_indices as match_against; visible_indices are every candidate
+        point that survived the in-front/angle/scale(/bounds) gates this
+        call, whether or not it went on to find an actual match - §VI-B's
+        "predicted visible" set (see Map.record_visible/record_found).
         """
         from scipy.spatial import cKDTree
 
-        subset = np.where(mask)[0] if mask is not None else np.arange(len(self))
+        subset_mask = self.active if mask is None else (mask & self.active)
+        subset = np.where(subset_mask)[0]
         if len(subset) == 0 or desc is None or len(desc) == 0 or len(kp) == 0:
-            return np.empty(0, dtype=int), np.empty(0, dtype=int)
+            return np.empty(0, dtype=int), np.empty(0, dtype=int), np.empty(0, dtype=int)
 
         rvec_pred, _ = cv2.Rodrigues(R_pred)
         proj, _ = cv2.projectPoints(self.points[subset], rvec_pred, t_pred, camera_matrix, None)
@@ -361,9 +483,16 @@ class Map:
         scale_ok = (dist >= d_min) & (dist <= d_max)
 
         candidate_mask = in_front & angle_ok & scale_ok
+        if image_shape is not None:
+            h, w = image_shape[0], image_shape[1]
+            bounds_ok = (proj[:, 0] >= 0) & (proj[:, 0] < w) & (proj[:, 1] >= 0) & (proj[:, 1] < h)
+            candidate_mask &= bounds_ok
+
         survivors = np.where(candidate_mask)[0]
         if len(survivors) == 0:
-            return np.empty(0, dtype=int), np.empty(0, dtype=int)
+            return np.empty(0, dtype=int), np.empty(0, dtype=int), np.empty(0, dtype=int)
+
+        visible_indices = subset[survivors]
 
         # Predicted pyramid octave (paper's PredictScale): the level at
         # which each surviving point should appear given its current
@@ -397,7 +526,7 @@ class Map:
             map_indices.append(subset[local_i])
             frame_indices.append(int(cand[order[0]]))
 
-        return np.array(map_indices, dtype=int), np.array(frame_indices, dtype=int)
+        return np.array(map_indices, dtype=int), np.array(frame_indices, dtype=int), visible_indices
 
 
 def estimate_pose_pnp(object_points, image_points, camera_matrix):
@@ -589,7 +718,15 @@ def _run_global_ba(keyframe_poses, keyframe_observations, sparse_map, camera_mat
         return None
     free_kfs = list(range(1, len(keyframe_poses)))
     fixed_kfs = [0]
-    point_ids = sorted({obs[0] for kf_obs in keyframe_observations for obs in kf_obs})
+    # keyframe_observations still carries stale entries for any point §VI-B
+    # has since culled (Map.remove_points only cleans the Map's own
+    # _keyframe_points/_covisibility, not this demo-local list) - filter
+    # against sparse_map.active so a removed point can't leak back into a
+    # full-trajectory BA pass as a live constraint.
+    point_ids = sorted(
+        {obs[0] for kf_obs in keyframe_observations for obs in kf_obs}
+        & set(np.where(sparse_map.active)[0].tolist())
+    )
     return _run_ba(keyframe_poses, keyframe_observations, sparse_map, camera_matrix,
                     free_kfs, fixed_kfs, point_ids, max_points=None,
                     max_nfev=max_nfev, ftol=ftol, xtol=xtol)
@@ -606,6 +743,9 @@ def _reprojection_error_stats(keyframe_poses, keyframe_observations, sparse_map,
     """
     errors = []
     for kf_idx, kf_obs in enumerate(keyframe_observations):
+        # Same stale-entry issue as _run_global_ba's point_ids: drop any
+        # observation of a point §VI-B has since culled.
+        kf_obs = [o for o in kf_obs if sparse_map.active[o[0]]]
         if not kf_obs:
             continue
         R, t, _ = keyframe_poses[kf_idx]
@@ -692,10 +832,10 @@ def _run_depth_densify(frame_image, R_pos, t_pos, sparse_map, map_indices, image
                         pnp_inlier_mask, camera_matrix, depth_estimator, depth_rows, scan_stride):
     """
     Estimates ML depth for this keyframe, fits it (scale + shift) against
-    the confirmed map points PnP just matched (map_indices/image_points,
-    restricted to pnp_inlier_mask - the same trusted set the pose itself was
-    solved against), then back-projects a sample of scanline pixels into
-    world points using that fit.
+    the map points PnP just matched (map_indices/image_points, restricted to
+    pnp_inlier_mask - the same trusted set the pose itself was solved
+    against), then back-projects a sample of scanline pixels into world
+    points using that fit.
 
     Purely a visual sanity check for now (see NOTES.md's v2 plan) - the
     caller must not feed the returned points into sparse_map/PnP/BA.
@@ -729,7 +869,7 @@ def _run_depth_densify(frame_image, R_pos, t_pos, sparse_map, map_indices, image
     # excluding just the (easier to identify reliably) background is more
     # forgiving, since anything not confidently background still gets
     # through. Only gates which pixels get turned into new points below -
-    # the calibration fit still uses every confirmed point regardless of
+    # the calibration fit still uses every matched point regardless of
     # surface. Runs on the camera image, not the depth map - see
     # detect_background_mask.
     background_mask = detect_background_mask(frame_image)
@@ -744,13 +884,13 @@ def _run_depth_densify(frame_image, R_pos, t_pos, sparse_map, map_indices, image
 
     fit = fit_disparity_scale_shift(disparity, inv_depth)
     if fit is None:
-        print(f"    [depth-densify: only {len(disparity)} confirmed points visible - "
+        print(f"    [depth-densify: only {len(disparity)} points visible - "
               f"skipping (need >= 10 for a stable fit)]")
         return np.empty((0, 3)), raw_depth, background_mask
 
     a, b = fit
 
-    # A degenerate fit (a close to 0 - the confirmed points barely span any
+    # A degenerate fit (a close to 0 - the calibration points barely span any
     # disparity range, e.g. a near-planar/low-depth-variety calibration set)
     # can still show a deceptively low RMSE in DISPARITY space while being
     # useless in Z space, since a/(disp-b) amplifies whatever small disparity
@@ -779,7 +919,7 @@ def _run_depth_densify(frame_image, R_pos, t_pos, sparse_map, map_indices, image
     # range instead rejects extrapolation directly, at its actual source.
     #
     # The raw min/max of that range is itself fragile, though: a single
-    # confirmed point that's unusually far (or just noisy) sets the boundary
+    # calibration point that's unusually far (or just noisy) sets the boundary
     # right at the edge of the range - close to b - and every scanline pixel
     # near that same edge still explodes even though it's nominally "in
     # range" (this is what kept producing near-infinite points intermittently
@@ -802,7 +942,7 @@ def _run_depth_densify(frame_image, R_pos, t_pos, sparse_map, map_indices, image
     pred_disp = a * inv_depth + b
     rmse = float(np.sqrt(np.mean((pred_disp - disparity) ** 2)))
     print(f"    [depth-densify: fit a={a:.3f} b={b:.3f} rmse={rmse:.3f} "
-          f"from {len(disparity)} confirmed points, {len(new_points)} ML points sampled]")
+          f"from {len(disparity)} points, {len(new_points)} ML points sampled]")
     return new_points, raw_depth, background_mask
 
 
@@ -942,7 +1082,7 @@ def _create_new_points_from_covisible_keyframes(
         kept_points = points_3d[valid]
 
         base_idx = len(sparse_map)
-        sparse_map.add_points(kept_points, desc_new[kept_q])
+        sparse_map.add_points(kept_points, desc_new[kept_q], created_kf=new_kf_idx)
         ids = list(range(base_idx, base_idx + len(kept_points)))
 
         i_center = camera_center(R_i, t_i)
@@ -972,9 +1112,9 @@ def _extend_new_points_to_other_covisible_keyframes(
     Map.match_against_guided's §V-D Track Local Map projection/matching
     (viewing-angle/scale-invariance gating, octave-aware search radius)
     rather than a separate search. Each match found is registered as an
-    independent re-observation (Map.confirm) - the same significance as any
-    other provisional point's confirming re-observation elsewhere in the
-    pipeline.
+    additional observation of the point - not fed into §VI-B's found/
+    predicted-visible bookkeeping, which is specifically about per-frame
+    tracking, not this keyframe-level founding search.
 
     Returns the total number of extra observations found.
     """
@@ -994,7 +1134,7 @@ def _extend_new_points_to_other_covisible_keyframes(
                 continue
             R_j, t_j, _ = keyframe_poses[kf_j]
             kp_j, desc_j = keyframe_kp[kf_j], keyframe_desc[kf_j]
-            map_idx, frame_idx = sparse_map.match_against_guided(
+            map_idx, frame_idx, _ = sparse_map.match_against_guided(
                 kp_j, desc_j, camera_matrix, R_j, t_j, window=window, ratio=ratio, mask=mask,
             )
             if len(map_idx) == 0:
@@ -1005,7 +1145,6 @@ def _extend_new_points_to_other_covisible_keyframes(
                     pid, kf_j, j_center, desc_j[int(fidx)], kp_j[int(fidx)].octave,
                     frame_idx=int(fidx),
                 )
-            sparse_map.confirm(map_idx)
             n_extra += len(map_idx)
 
     return n_extra
@@ -1027,7 +1166,7 @@ def _demo():
     parser = argparse.ArgumentParser(
         description="Bootstrap a sparse map once, then track pose every frame via "
                      "motion-predicted guided PnP against it, inserting a keyframe "
-                     "(triangulation/confirmation/BA) once the paper's own §V-E "
+                     "(triangulation/culling/BA) once the paper's own §V-E "
                      "multi-condition policy says one is needed"
     )
     parser.add_argument("--video", required=True,
@@ -1050,7 +1189,7 @@ def _demo():
                               "but measured worse on every metric; see EVALUATION_RESULTS.md) "
                               "or whether a pose is estimated at all once tracking a map (px)")
     parser.add_argument("--kf-min-tracked-points", type=int, default=50,
-                         help="Paper §V-E condition: minimum PnP-tracked confirmed map "
+                         help="Paper §V-E condition: minimum PnP-tracked map "
                               "points a frame must have before it can be promoted to a "
                               "keyframe")
     parser.add_argument("--kf-ref-ratio", type=float, default=0.9,
@@ -1072,7 +1211,7 @@ def _demo():
                               "'local mapping idle' condition, which has no meaning here "
                               "since there's no separate mapping thread")
     parser.add_argument("--guided-window", type=float, default=60.0,
-                         help="Pixel radius around each confirmed map point's motion-"
+                         help="Pixel radius around each map point's motion-"
                               "predicted projection to search for a descriptor match "
                               "during per-frame PnP tracking, replacing an unguided "
                               "full-frame search (see Map.match_against_guided)")
@@ -1081,7 +1220,7 @@ def _demo():
                               "observed points) guided matching searches against - keeps "
                               "the most recently added points if exceeded. On a small or "
                               "heavily-revisited scene, even a handful of keyframes can "
-                              "together observe most of the confirmed map, so bounding "
+                              "together observe most of the map, so bounding "
                               "keyframe count alone (see Map.local_map_keyframes) isn't "
                               "enough to keep this per-frame search cost bounded")
     parser.add_argument("--min-inliers", type=int, default=60,
@@ -1111,12 +1250,6 @@ def _demo():
                               "searches for correspondences against - bounds the added "
                               "per-keyframe cost of matching+epipolar-checking against "
                               "multiple keyframes instead of just the previous one")
-    parser.add_argument("--confirm-reproj-error", type=float, default=4.0,
-                         help="Max reprojection error (px) for a provisional point to count "
-                              "as independently re-observed")
-    parser.add_argument("--confirm-count", type=int, default=1,
-                         help="Number of independent re-observations a provisional point "
-                              "needs before being promoted to confirmed/trusted")
     parser.add_argument("--max-step-ratio", type=float, default=6.0,
                          help="Reject a PnP pose if the camera-center displacement vs. the "
                               "previous tracked frame exceeds this many multiples of the "
@@ -1178,7 +1311,7 @@ def _demo():
                          help="Disable the live matches+trajectory window")
     parser.add_argument("--depth-densify", action="store_true",
                          help="At each accepted keyframe, estimate ML depth and fit it "
-                              "(scale + shift) against the map's own confirmed points, "
+                              "(scale + shift) against the map's own points, "
                               "then back-project scanline samples for visual "
                               "sanity-checking. Not yet fed into pose estimation, PnP, "
                               "or bundle adjustment - plotting only")
@@ -1196,7 +1329,7 @@ def _demo():
         parser.error("--depth-densify requires --model")
 
     grid_rows, grid_cols = (int(v) for v in args.grid.lower().split("x"))
-    sparse_map = Map(required_confirmations=args.confirm_count)
+    sparse_map = Map()
 
     R_pos = np.eye(3)
     t_pos = np.zeros((3, 1))
@@ -1245,11 +1378,14 @@ def _demo():
     n_keyframes = 0
     n_tracked_only = 0
     n_skipped = 0
+    # §VI-B culling totals across the whole run, for the final report.
+    total_culled_trial = 0
+    total_culled_ongoing = 0
 
     # §V-D Track Local Map state: ref_kf_idx is the keyframe index backing
     # ref_kp/ref_desc/ref_R/ref_t (kept in lockstep with them below);
-    # last_tracked_map_indices is the set of confirmed map points matched
-    # in the most recently *accepted* tracked frame - together these seed
+    # last_tracked_map_indices is the set of map points matched in the most
+    # recently *accepted* tracked frame - together these seed
     # local_map_keyframes' K1 (falling back to just the reference keyframe
     # before any frame has been tracked against this map yet).
     ref_kf_idx = 0
@@ -1345,12 +1481,9 @@ def _demo():
                             kept_matches = [m for m, keep in zip(kept_matches, valid) if keep]
                             new_desc = desc[[m.trainIdx for m in kept_matches]]
 
+                            new_kf_idx = len(keyframe_poses)  # kf 1 - about to be appended below
                             base_idx = len(sparse_map)
-                            # Bootstrap points are seeded as confirmed directly - there's
-                            # no "already trusted" map yet to independently re-observe
-                            # against, and bootstrap already required a strict essential-
-                            # matrix + high-inlier-count pose rather than a lenient PnP.
-                            sparse_map.add_points(new_points[valid], new_desc, confirmed=True)
+                            sparse_map.add_points(new_points[valid], new_desc, created_kf=new_kf_idx)
                             new_ids = list(range(base_idx, base_idx + int(valid.sum())))
                             obs_ref = pts1[inlier_mask][valid]
                             obs_cur = pts2[inlier_mask][valid]
@@ -1378,7 +1511,7 @@ def _demo():
                                 )
                             for pid, fidx in zip(new_ids, cur_frame_idx):
                                 sparse_map.add_observation(
-                                    pid, len(keyframe_poses), cur_center, desc[fidx], kp[fidx].octave,
+                                    pid, new_kf_idx, cur_center, desc[fidx], kp[fidx].octave,
                                     frame_idx=fidx,
                                 )
 
@@ -1396,6 +1529,10 @@ def _demo():
                             keyframe_poses.append(KeyframePose(R_pos, t_pos, frame.timestamp))
                             keyframe_kp.append(kp)
                             keyframe_desc.append(desc)
+                            culled_trial = sparse_map.cull_new_points(new_kf_idx)
+                            culled_ongoing = sparse_map.cull_low_observation_points(new_kf_idx)
+                            total_culled_trial += len(culled_trial)
+                            total_culled_ongoing += len(culled_ongoing)
                             if not args.no_ba and len(keyframe_poses) % args.ba_every == 0:
                                 ba_result = _run_local_ba(keyframe_poses, keyframe_observations,
                                                            sparse_map, K,
@@ -1411,9 +1548,8 @@ def _demo():
 
             else:
                 # --- Track: motion-predicted guided PnP against the map,
-                # attempted every frame (confirmed points only - provisional
-                # points must never influence the pose that could end up
-                # confirming them). --min-parallax plays no role here at all -
+                # attempted every frame against every active (not yet §VI-B-
+                # culled) point. --min-parallax plays no role here at all -
                 # it only gates bootstrap's essential-matrix estimation above;
                 # whether this frame's tracked pose *also* gets promoted to a
                 # keyframe is decided purely by the §V-E policy below. ---
@@ -1444,9 +1580,10 @@ def _demo():
                 # most recently tracked frame, or just the reference keyframe
                 # if none has been tracked yet against this map) union K2
                 # (K1's covisibility-graph neighbors) - bounds guided
-                # matching to a subset of the confirmed map that stays a
-                # roughly constant size as the map grows, instead of every
-                # confirmed point ever added.
+                # matching to a subset of the map that stays a roughly
+                # constant size as the map grows, instead of every point
+                # ever added. match_against_guided further restricts this to
+                # active (not yet §VI-B-culled) points regardless.
                 local_seed = (
                     last_tracked_map_indices if last_tracked_map_indices is not None
                     else np.empty(0, dtype=int)
@@ -1460,12 +1597,21 @@ def _demo():
                 local_mask = np.zeros(len(sparse_map), dtype=bool)
                 if local_points:
                     local_mask[list(local_points)] = True
-                local_mask &= sparse_map.confirmed
 
-                map_indices, frame_indices = sparse_map.match_against_guided(
+                map_indices, frame_indices, visible_indices = sparse_map.match_against_guided(
                     kp, desc, K, R_pred, t_pred,
                     window=effective_window, ratio=args.ratio, mask=local_mask,
+                    image_shape=frame.image.shape,
                 )
+                # §VI-B bookkeeping: every frame this point was predicted
+                # visible (a Track Local Map candidate that survived the
+                # in-front/angle/scale/bounds gates) counts toward the
+                # denominator, whether or not it was actually matched below;
+                # every frame it was actually matched counts toward the
+                # numerator - independent of whether PnP goes on to accept
+                # this frame's pose at all.
+                sparse_map.record_visible(visible_indices)
+                sparse_map.record_found(map_indices)
                 if len(map_indices) < 6:
                     status = f"too few guided map matches ({len(map_indices)})"
                 else:
@@ -1605,53 +1751,15 @@ def _demo():
                                         frame_idx=fidx,
                                     )
 
-                                # Now that the pose is trustworthy (confirmed points
-                                # only), check provisional points for independent
-                                # re-observation. Each one that reprojects consistently
-                                # gets one confirmation credit - promoted to confirmed
-                                # only after accumulating enough of them (see Map).
-                                prov_map_idx, prov_frame_idx = sparse_map.match_against(
-                                    desc, args.ratio, mask=~sparse_map.confirmed
-                                )
-                                n_reobserved = 0
-                                if len(prov_map_idx) > 0:
-                                    rvec_new, _ = cv2.Rodrigues(R_new)
-                                    proj, _ = cv2.projectPoints(
-                                        sparse_map.points[prov_map_idx], rvec_new, t_new, K, None
-                                    )
-                                    proj = proj.reshape(-1, 2)
-                                    prov_pixels = np.float32([kp[i].pt for i in prov_frame_idx])
-                                    errors = np.linalg.norm(proj - prov_pixels, axis=1)
-                                    good = errors < args.confirm_reproj_error
-                                    reobserved_idx = prov_map_idx[good]
-                                    reobserved_frame_idx = prov_frame_idx[good]
-                                    reobserved_pixels = prov_pixels[good]
-                                    sparse_map.confirm(reobserved_idx)
-                                    for pid, fidx, (x, y) in zip(
-                                        reobserved_idx, reobserved_frame_idx, reobserved_pixels
-                                    ):
-                                        sparse_map.add_observation(
-                                            pid, new_kf_idx, new_center, desc[int(fidx)],
-                                            kp[int(fidx)].octave, frame_idx=int(fidx),
-                                        )
-                                    this_kf_observations.extend(
-                                        (int(idx), float(x), float(y))
-                                        for idx, (x, y) in zip(reobserved_idx, reobserved_pixels)
-                                    )
-                                    this_kf_frame_idx.extend(reobserved_frame_idx.tolist())
-                                    n_reobserved = int(good.sum())
-
                                 # §VI-C: search for new-point correspondences across
                                 # EVERY keyframe connected to this one in the
                                 # covisibility graph (not just the immediately
                                 # preceding one). Excludes, on this keyframe's side,
                                 # features already tied to an existing map point
-                                # (matched or re-observed above); each covisible
-                                # keyframe's own already-matched features are excluded
-                                # on its side inside the helper itself.
-                                already_matched_frame_idx = (
-                                    set(frame_indices.tolist()) | set(prov_frame_idx.tolist())
-                                )
+                                # (matched above); each covisible keyframe's own
+                                # already-matched features are excluded on its side
+                                # inside the helper itself.
+                                already_matched_frame_idx = set(frame_indices.tolist())
                                 covisible_candidates = _covisible_candidates(
                                     sparse_map, new_kf_idx, ref_kf_idx,
                                     args.new_point_max_covisible_keyframes,
@@ -1689,8 +1797,7 @@ def _demo():
                                 # from and search for a further correspondence there too
                                 # - reuses match_against_guided (§V-D Track Local Map)
                                 # rather than a separate search. Each additional match
-                                # counts as an independent re-observation, same as a
-                                # provisional point's confirming re-observation above.
+                                # counts as one more observation of the point.
                                 n_extra_obs = _extend_new_points_to_other_covisible_keyframes(
                                     sparse_map, new_point_ids, new_source_kf, covisible_candidates,
                                     keyframe_poses, keyframe_kp, keyframe_desc, K,
@@ -1705,16 +1812,26 @@ def _demo():
                                       f"rotation={rot_deg:.1f}deg  "
                                       f"{pnp_inliers}/{len(map_indices)} PnP inliers, "
                                       f"trigger={kf_trigger}  "
-                                      f"{new_count} new (provisional) points from "
+                                      f"{new_count} new points from "
                                       f"{len(set(new_source_kf))}/{len(covisible_candidates)} covisible "
-                                      f"keyframes searched, {n_extra_obs} extra re-observations, "
-                                      f"{n_reobserved} re-observed "
-                                      f"({sparse_map.n_confirmed} confirmed / {len(sparse_map)} total)")
+                                      f"keyframes searched, {n_extra_obs} extra observations "
+                                      f"({len(sparse_map)} total map points)")
 
                                 keyframe_poses.append(KeyframePose(R_pos, t_pos, frame.timestamp))
                                 keyframe_kp.append(kp)
                                 keyframe_desc.append(desc)
                                 keyframe_observations.append(this_kf_observations)
+                                # §VI-B Recent Map Points Culling - run once per
+                                # keyframe insertion, on this keyframe's own index.
+                                culled_trial = sparse_map.cull_new_points(new_kf_idx)
+                                culled_ongoing = sparse_map.cull_low_observation_points(new_kf_idx)
+                                total_culled_trial += len(culled_trial)
+                                total_culled_ongoing += len(culled_ongoing)
+                                print(f"    [culling: {len(culled_trial)} removed by the "
+                                      f"first-3-keyframe test, {len(culled_ongoing)} removed by "
+                                      f"the ongoing <3-observing-keyframe rule "
+                                      f"({sparse_map.n_active} active / {len(sparse_map)} total "
+                                      f"map points)]")
                                 if not args.no_ba and len(keyframe_poses) % args.ba_every == 0:
                                     ba_result = _run_local_ba(keyframe_poses, keyframe_observations,
                                                                sparse_map, K,
@@ -1792,8 +1909,7 @@ def _demo():
                 else:
                     traj_vis = render_trajectory(
                         positions,
-                        sparse_map.points[sparse_map.confirmed],
-                        sparse_map.points[~sparse_map.confirmed],
+                        sparse_map.points[sparse_map.active],
                         size=match_vis.shape[0],
                     )
                 panels.append(traj_vis)
@@ -1838,7 +1954,9 @@ def _demo():
         cv2.destroyAllWindows()
 
     print(f"\n{n_keyframes} keyframes accepted "
-          f"({sparse_map.n_confirmed} confirmed / {len(sparse_map)} total map points), "
+          f"({sparse_map.n_active} active / {len(sparse_map)} total map points - "
+          f"{total_culled_trial} removed by the first-3-keyframe test, "
+          f"{total_culled_ongoing} removed by the ongoing <3-observing-keyframe rule), "
           f"{n_skipped} frames not promoted to a keyframe "
           f"({n_tracked_only} still tracked frame-only, "
           f"{n_skipped - n_tracked_only} lost tracking entirely)")
@@ -1902,14 +2020,10 @@ def _demo():
             ax.scatter(ml_points[:, 0], ml_points[:, 2],
                        c="lightblue", s=2, label="ML depth (unverified)", zorder=0)
     elif len(sparse_map) > 0:
-        confirmed_pts = sparse_map.points[sparse_map.confirmed]
-        provisional_pts = sparse_map.points[~sparse_map.confirmed]
-        if len(provisional_pts) > 0:
-            ax.scatter(provisional_pts[:, 0], provisional_pts[:, 2],
-                       c="orange", s=4, label="provisional points", zorder=1)
-        if len(confirmed_pts) > 0:
-            ax.scatter(confirmed_pts[:, 0], confirmed_pts[:, 2],
-                       c="black", s=4, label="confirmed points", zorder=1)
+        active_pts = sparse_map.points[sparse_map.active]
+        if len(active_pts) > 0:
+            ax.scatter(active_pts[:, 0], active_pts[:, 2],
+                       c="black", s=4, label="map points", zorder=1)
     ax.plot(positions[:, 0], positions[:, 2], "-o", markersize=2, linewidth=1, zorder=2)
     ax.scatter(positions[0, 0], positions[0, 2], c="green", s=80, label="start", zorder=5)
     ax.scatter(positions[-1, 0], positions[-1, 2], c="red", s=80, label="end", zorder=5)

@@ -1005,3 +1005,138 @@ above (this codebase's map is dense enough post-#23/#24 that PnP tracking
 stays confident far longer than the paper's sparser-map assumptions
 anticipate) - reported honestly per the issue's own instruction, not
 adjusted to match the "expect an increase" prediction.
+
+---
+
+## #26: Recent map point culling, replacing the provisional/confirmed lifecycle (paper §VI-B)
+
+**Version:** `issue-26-recent-map-point-culling` branch, on top of `main`
+post-#25 (`--depth-densify` not passed). Implements
+[#26](https://github.com/albinjanssonsand/slam/issues/26): `Map.confirm`/
+`Map.confirmed`/`confirmation_count` (a point excluded from PnP/BA until it
+accumulates `--confirm-count` independent re-observations, and never removed
+once added) is deleted outright and replaced with the paper's Recent Map
+Points Culling test (§VI-B). Every point is now usable in PnP, guided
+matching, and BA from the moment it's created - there's no more admission
+gate - but it's checked during its first three keyframes after creation and
+removed if it's found by tracking in at most 25% of the frames it was
+predicted visible in, or (once more than one keyframe has passed since its
+creation) if it hasn't been observed from at least three keyframes. New
+per-point bookkeeping (`Map.created_kf`/`n_visible`/`n_found`, `Map.
+record_visible`/`record_found`, called every tracking frame from the §V-D
+Track Local Map guided-matching call) drives this; `Map.cull_new_points`/
+`cull_low_observation_points` run once per keyframe insertion and call a new
+`Map.remove_points`, which excludes a point from every future match/local-
+map/BA query by cleaning it out of the covisibility graph's keyframe/point
+sets rather than by physically deleting its row (point indices stay stable
+everywhere else - `keyframe_observations`, BA point ids). An ongoing rule
+(`cull_low_observation_points`) also removes any already-surviving point
+whose observing-keyframe count later drops below three - a no-op today
+since nothing yet reduces observation counts (no keyframe culling, no BA
+outlier-observation removal), but implemented so those can plug into it
+later. Every call site that gated on `sparse_map.confirmed` (PnP/guided
+matching, the old provisional-point re-observation scan) was updated or
+removed; `--confirm-count`/`--confirm-reproj-error` are gone from the CLI.
+
+**Two real bugs found during self-review and fixed before any of the
+numbers below were trustworthy:**
+
+- **`--global-ba-at-end` silently re-included culled points.** `_run_global_ba`
+  and `_reprojection_error_stats` built their point/observation sets
+  directly from the demo-local `keyframe_observations` list, which
+  `Map.remove_points` never touches (it only cleans the `Map`'s own
+  internal graph state) - so a culled point's stale observations kept
+  flowing into a full-trajectory BA pass as live constraints, contradicting
+  `remove_points`'s own docstring guarantee. Fixed by filtering both against
+  `sparse_map.active` before use. Doesn't affect the default (no
+  `--global-ba-at-end`) run below.
+- **A culled point's originating ORB feature stayed permanently
+  unavailable.** `remove_points` cleaned the covisibility graph's
+  keyframe/point sets but not `_keyframe_matched_frame_idx` (per-keyframe
+  "this feature already belongs to a map point" bookkeeping §VI-C's new-
+  point search consults) - so once a point founded from keyframe K's
+  feature #120 was culled, feature #120 stayed flagged "already matched"
+  forever, permanently blocking any future keyframe from spawning a
+  replacement point there. Fixed by threading `frame_idx` through each
+  stored observation and freeing it in `remove_points`. This one *does*
+  affect the run below (it's on the default per-keyframe path) - the
+  numbers below are from after the fix.
+
+**Culling activity (required by the issue), `freiburg1_xyz`, full run:**
+
+| | Total map points ever created | Removed by first-3-keyframe test | Removed by ongoing <3-keyframe rule | Active (surviving) |
+|---|---|---|---|---|
+| This issue | 60765 | 43835 (72.1%) | 0 | 16930 (27.9%) |
+
+The first-3-keyframe test is doing substantial, real work - nearly three
+quarters of every point ever triangulated is rejected within its first three
+keyframes, leaving a map under a third the size it would otherwise reach.
+The ongoing rule never fires, as anticipated in its own docstring: nothing
+in this pipeline yet reduces an already-surviving point's observing-keyframe
+count (no keyframe culling, no BA marking observations as outliers), so
+there's no trigger for it today - implemented per the issue's own scope
+(the removal rule itself, not those triggers) for #23/#19's later
+covisibility-graph work to build on.
+
+**Outlier reduction (required by the issue) - qualitative point-cloud
+check:** `results/culling_xyz_trajectory.png` still shows a handful of
+far-flung outlier points (up to ~200 units from the trajectory, vs. the
+main point cloud's ~0-90 unit spread) alongside the dense, well-formed
+cluster directly ahead of the camera path. **Culling does not eliminate
+geometric outliers** - and shouldn't be expected to: §VI-B's test checks
+re-observation *frequency* (found/predicted-visible ratio, observing-
+keyframe count), not geometric plausibility, so a mistriangulated point that
+still gets matched consistently by tracking (e.g. a systematically-biased
+but internally self-consistent batch, per `triangulation.triangulate`'s own
+docstring) satisfies the culling test just as easily as a good point does.
+What culling *does* demonstrably do is shrink the map by removing points
+that fail to be *re-found* reliably (the 72.1% above) - a different,
+complementary notion of "outlier" than mistriangulated geometry, matching
+the paper's own framing (§VI-B exists to drop points that don't hold up
+under continued tracking, not to geometrically filter triangulation).
+Reported honestly per the issue's own acceptance criteria, rather than
+claimed as a geometric-outlier fix it isn't.
+
+**freiburg1_xyz, full run:**
+
+| Sequence | Frames | Keyframes accepted | Active / total map points | Trajectory coverage | ATE RMSE (m) | RPE RMSE (m) | Wall clock |
+|---|---|---|---|---|---|---|---|
+| `freiburg1_xyz` (baseline, #25's canonical row) | 798 | 88 | 39476 / 47591 (confirmed/total) | 86.4% (26.0s / 30.1s) | 0.0409 | 0.0436 | ~14m14s |
+| `freiburg1_xyz` (this issue) | 798 | 80 | 16930 / 60765 (active/total) | 88.3% (26.6s / 30.1s) | 0.0321 | 0.0323 | ~16 min |
+
+(`results/culling_xyz_vs_groundtruth.png` - the aligned estimate closely
+tracks ground truth's same crossing figure-eight sweep, a tight overlay
+rather than a loose or scribbled one.)
+
+**Reading these numbers:** this is a clear win on every accuracy metric
+measured, not just a wash from the lifecycle replacement. ATE RMSE improves
+21.5% (0.0409m -> 0.0321m) and RPE RMSE improves 26.0% (0.0436m -> 0.0323m)
+versus #25's baseline, with coverage essentially unchanged (88.3% vs.
+86.4%) and tracking-loss frame count comparable (1/798 lost entirely, same
+order as every other non-"too hard" run in this file). The "confirmed/
+total" and "active/total" columns aren't directly comparable (different
+admission semantics - see above), but the qualitative shift is real: under
+the old lifecycle, ~83% of every point ever created stayed in the map
+forever (never removed, only split confirmed/provisional); under this
+issue's culling, only ~28% survive at all. Keyframe count drops modestly
+(88 -> 80, -9%), plausibly because a smaller, more aggressively-pruned local
+map changes exactly the tracked-point counts §V-E's keyframe policy
+(`--kf-min-tracked-points`/`--kf-ref-ratio`) reacts to - not investigated
+further here, out of this issue's own admission/removal-only scope. Wall
+clock is comparable (~16 min vs. ~14m14s), the added per-frame visibility
+bookkeeping and per-keyframe culling sweep costing a small, unmeasured-in-
+isolation amount, consistent with the issue's own performance requirement
+("a small amount of per-point work every frame").
+
+**Net result:** the paper's §VI-B test is implemented as specified and
+measured fresh (not conflated with the earlier, already-reverted "map point
+culling" experiment `NOTES.md` documents - different trigger, window, and
+target, per the issue's own note) - it removes a large majority (72.1%) of
+ever-created points within their first three keyframes, and delivers a
+genuine accuracy improvement (ATE -21.5%, RPE -26.0%) at comparable coverage
+and wall-clock cost. It does not, and by design cannot, geometrically filter
+mistriangulated-but-consistently-tracked outliers - reported honestly per
+the issue's own acceptance criteria rather than overclaimed. Two real bugs
+surfaced and fixed during self-review (`--global-ba-at-end` point leakage;
+permanent ORB-feature-slot loss on culled points) before these numbers were
+trustworthy.
