@@ -1140,3 +1140,221 @@ the issue's own acceptance criteria rather than overclaimed. Two real bugs
 surfaced and fixed during self-review (`--global-ba-at-end` point leakage;
 permanent ORB-feature-slot loss on culled points) before these numbers were
 trustworthy.
+
+---
+
+## #33: Triangulation-time reprojection-error/scale-consistency checks and BA outlier-observation discarding (paper §VI-C/§VI-D)
+
+**Version:** `issue-33-triangulation-checks-ba-outlier-discard` branch, on
+top of `main` post-#26 (`--depth-densify` not passed). Implements
+[#33](https://github.com/albinjanssonsand/slam/issues/33), closing the two
+gaps #26 documented: `triangulation.triangulate()` now also checks
+reprojection error and scale consistency (previously only cheirality and
+parallax), and local/global bundle adjustment now discard BA-outlier
+observations, which - for the first time - gives `Map.
+cull_low_observation_points` (#26's "ongoing" rule, a documented no-op until
+now) something to actually remove.
+
+`triangulate()` gained optional `octave1`/`octave2` (per-keypoint ORB
+pyramid octave, one array per view). When given, a candidate is now also
+rejected if its reprojection error in either view exceeds a chi-squared
+bound (default 5.991 - the standard 95%-confidence, 2-DOF threshold,
+matching ORB-SLAM2's own default) scaled by that view's detection-octave
+variance, or if the ratio of its distance to each camera is inconsistent
+(within a tolerance factor) with the ratio of the two views' pyramid scale
+factors at the detected octaves - both checks mirror ORB-SLAM2's
+`CreateNewMapPoints` acceptance test directly. Both real call sites
+(bootstrap triangulation, `_create_new_points_from_covisible_keyframes`)
+were updated to pass real octave arrays; `pipeline.pose`'s older, superseded
+standalone demo was left untouched (the new params default to `None`,
+preserving its old cheirality+parallax-only behavior).
+
+`bundle_adjustment.local_bundle_adjustment` now runs a second classify-and-
+discard pass matching the paper's own wording ("observations that are
+marked as outliers are discarded at the middle and at the end of the
+optimization"): after the first Huber-loss solve, every observation's
+squared reprojection error is checked against a chi-squared bound; flagged
+ones are excluded and the window is re-solved with the survivors (the
+"middle" checkpoint), then re-classified once more (the "end" checkpoint) to
+catch anything the re-solve's shifted estimate newly exposes. `Map` gained
+`remove_observation(point_idx, kf_idx)` - the missing inverse of
+`add_observation` (drops one observation, decrements the covisibility edge,
+frees the matched-frame-idx slot, recomputes the point's §III-C metadata
+from what remains) - and a new `mapping._discard_ba_outlier_observations`
+uses it to physically remove every BA-flagged observation from both `Map`
+and the flat `keyframe_observations` list, then calls `cull_low_observation_
+points`. This is the concrete mechanism #26's culling test could never
+reach on its own.
+
+### Three real bugs found before these numbers were trustworthy
+
+Two surfaced during self-review (2 parallel reviewer passes, since the diff
+spans 3 tightly-coupled files at 518 changed lines) and were fixed before
+any run below; a third only showed up once the actual `freiburg1_xyz` run's
+numbers looked wrong, and was root-caused and fixed before accepting the
+final numbers:
+
+- **The BA outlier-classification guard was bypassed by its own "end"
+  checkpoint.** The guard exists specifically to skip discarding when too
+  many (or too few surviving) observations exceed the chi-squared bound -
+  its own comment says that's "a sign of a bad solve, not real outliers."
+  But when the guard blocked the re-solve, `obs_mask`/`result.x` were left
+  untouched, so the "end" checkpoint reclassified the *identical* full set
+  against the *identical* solve, reproducing the same flagged indices and
+  returning them as trusted outliers anyway - in the worst case
+  (`mid_outliers.sum() == len(obs)`), discarding an entire BA window's
+  observations in one shot, the opposite of the guard's intent. Fixed to
+  report zero outliers whenever the guard doesn't trust the classification,
+  rather than silently reusing it.
+- **A point could be left `active` with zero observations and stale
+  metadata.** `remove_observation` had no equivalent of `remove_points`'s
+  full unlink for the specific case of a point's *last* observation being
+  popped - if both of a just-triangulated point's founding observations were
+  flagged outliers within the same keyframe's BA call, the point stayed
+  `active` (age-gated `cull_new_points`/`cull_low_observation_points` can't
+  catch it at `elapsed == 0`) with pre-removal viewing-direction/scale-
+  invariance bounds, eligible for guided matching until some later
+  keyframe's age-gated check happened to catch it. Fixed: `remove_observation`
+  now calls `remove_points` immediately, unconditionally, the moment a point
+  drops to zero observations - closing the gap regardless of age.
+- **The BA outlier chi-squared threshold was flat (implicitly octave-0-only),
+  which measurably hurt accuracy rather than helping.** The first full
+  `freiburg1_xyz` run (after fixing the two bugs above) showed ATE/RPE
+  *regressing* by more than 50% versus #26's baseline (ATE 0.0321m ->
+  0.0493m, RPE 0.0323m -> 0.0519m) - ORB observations are legitimately less
+  precisely localized in pixel space at coarser pyramid octaves (the same
+  reasoning `triangulate()`'s own reprojection check, and `Map`'s existing
+  `d_min`/`d_max` scale-invariance bounds, already account for), so a flat
+  chi-squared bound calibrated for octave 0 was flagging large numbers of
+  perfectly good coarser-octave observations as outliers and discarding real
+  constraining data - 975 observations discarded, 63 points removed, on that
+  first run. Root-caused rather than accepted as "the paper's checks just
+  don't help here": added `Map.observation_octave(point_idx, kf_idx)` and
+  threaded per-observation octave metadata through `_run_ba` into
+  `local_bundle_adjustment`, which now scales the chi-squared bound per
+  observation by `pyramid_scale_factor ** (2*octave)`, exactly mirroring
+  `triangulate()`'s own treatment. Re-running after this fix dropped outlier
+  discarding to a much more conservative 120 observations/8 points (see
+  below) and turned the regression into a genuine improvement.
+
+### Triangulation-rejection demonstration (required - direct, not just end-to-end)
+
+Ad hoc synthetic script (not committed - no test suite exists in this repo),
+constructing exact pixel coordinates for a calibrated pure-X-translation
+stereo pair:
+
+- A well-conditioned point (real cheirality, 5.7deg parallax) passes both
+  new checks, as expected.
+- The same point pair with view 2 perturbed 15px **off the epipolar line**
+  is accepted by today's cheirality+parallax-only test but **rejected** once
+  the reprojection-error check is enabled (`valid: True -> False`). Note:
+  a *horizontal* (epipolar-consistent) 15px perturbation is NOT rejected -
+  2-view `cv2.triangulatePoints` DLT reprojects any epipolar-consistent
+  correspondence with ~zero error regardless of the resulting depth (this is
+  inherent to linear 2-view triangulation, not a gap in this
+  implementation - ORB-SLAM2's own `CreateNewMapPoints` has the identical
+  property, since it also epipolar-filters candidates before triangulating).
+  The reprojection-error check is therefore a check on whether the
+  *correspondence* was real, not on whether the resulting *depth* is
+  plausible - an implausibly close **or** far depth from an
+  epipolar-consistent correspondence is still only caught by the existing
+  parallax-angle check, exactly as before this issue.
+- The same well-conditioned point, given deliberately mismatched octaves
+  (`octave1=0, octave2=5`, implying a ~2.49x distance ratio the actual ~1.0x
+  triangulated ratio doesn't match), is accepted without the scale-
+  consistency check and **rejected** with it (`valid: True -> False`).
+
+### BA outlier-discard demonstration (required - direct, not just end-to-end)
+
+Second ad hoc script: 4 keyframes, 30 points, one observation corrupted by
+40px.
+
+- `local_bundle_adjustment` flags exactly that one injected observation -
+  no false positives among the other 119 clean, noisy (0.3px) observations.
+- `_discard_ba_outlier_observations` correctly drops the Map's observing-
+  keyframe count for that point from 4 to 3 and removes its entry from
+  `keyframe_observations`; `cull_low_observation_points` correctly does
+  *not* remove it at exactly 3 (the paper's own boundary).
+- Manually discarding a second point's observations down to 2 observing
+  keyframes (the same primitive, invoked twice) confirms
+  `cull_low_observation_points` *does* fire at that point, removing it -
+  the first time this trigger has ever been reachable (#26 landed it as a
+  documented no-op).
+
+### Culling/BA-discard activity (required by the issue), `freiburg1_xyz`, full run
+
+| | Total map points ever created | Removed by first-3-keyframe test | Removed by the ongoing <3-observing-keyframe rule (total) | ...of which via BA-outlier discard (#33, new) | Active (surviving) |
+|---|---|---|---|---|---|
+| #26 (baseline) | 60765 | 43835 (72.1%) | 0 | n/a (trigger didn't exist) | 16930 (27.9%) |
+| This issue | 59138 | 43058 (72.8%) | 11 | 8 | 16069 (27.2%) |
+
+BA discarded 120 observations across all local BA passes over the run (no
+`--global-ba-at-end`), of which 8 points' observation counts dropped below
+3 as a direct, immediate result - `cull_low_observation_points` firing for
+the first time via this trigger, exactly as #26 anticipated it eventually
+would. The remaining 3 (of the 11 total ongoing-rule removals) came via the
+pre-existing per-keyframe check rather than the new post-BA check
+specifically - plausibly a point whose BA-discarded observation happened
+while it was still within its first-3-keyframe window (age-gated out of
+`cull_low_observation_points`'s own candidate set at the moment of
+discarding, then caught once it aged past that window) - not separately
+instrumented to prove that attribution, reported as a plausible explanation
+rather than a confirmed one. Total ever-created points also dropped
+slightly (60765 -> 59138, -2.7%), attributable to the new triangulation-time
+checks now rejecting some candidates at creation time that previously
+reached the map (and, in some fraction of cases, would only have been
+caught later by the first-3-keyframe test or contributed to the far-flung
+outliers below).
+
+**Outlier reduction (required by the issue) - qualitative point-cloud
+check:** comparing `results/culling_xyz_trajectory.png` (#26, before) with
+this issue's `results/ba_outlier_xyz_trajectory.png` (after): the most
+extreme far-flung outliers are visibly reduced - #26's plot shows points out
+to ~215 units from the trajectory (e.g. around (-115, 213)); this issue's
+plot's most extreme points reach only ~130 units (e.g. around (-40, 125)).
+Reported honestly per the issue's own acceptance bar ("implemented the
+paper's checks correctly and measured the effect," not "eliminated every
+outlier"): this is a real, visible reduction, not a complete fix - some
+80-130 unit outliers remain, consistent with the reprojection-error check's
+inherent epipolar-consistency limitation documented above (an
+epipolar-consistent-but-wrong-depth correspondence isn't caught by either
+new check, only by the pre-existing parallax-angle test).
+
+**freiburg1_xyz, full run:**
+
+| Sequence | Frames | Keyframes accepted | Active / total map points | Trajectory coverage | ATE RMSE (m) | RPE RMSE (m) | Wall clock |
+|---|---|---|---|---|---|---|---|
+| `freiburg1_xyz` (baseline, #26's canonical row) | 798 | 80 | 16930 / 60765 | 88.3% (26.6s / 30.1s) | 0.0321 | 0.0323 | ~16 min |
+| `freiburg1_xyz` (this issue) | 798 | 78 | 16069 / 59138 | 88.1% (26.5s / 30.1s) | 0.0250 | 0.0255 | ~15 min |
+
+(`results/ba_outlier_xyz_vs_groundtruth.png` - the aligned estimate closely
+tracks ground truth's same crossing figure-eight sweep, a tight overlay.)
+
+**Reading these numbers:** a genuine accuracy improvement on both metrics -
+ATE RMSE -22.1% (0.0321m -> 0.0250m), RPE RMSE -21.1% (0.0323m -> 0.0255m) -
+at essentially unchanged coverage (88.1% vs 88.3%) and comparable wall-clock
+cost, with keyframe count modestly lower (80 -> 78, -2.5%). This is *after*
+fixing the octave-aware chi-squared bug above; the first (buggy) run showed
+the opposite - a >50% regression - which is itself informative: a correctly
+scale-aware implementation of the paper's outlier-discard rule helps, but a
+naively flat threshold actively hurts by discarding good, low-precision-but-
+legitimate observations. Consistent with #26's own finding, this can't be
+attributed to eliminating geometric outliers wholesale (the qualitative
+check above shows some remain, by design) - the improvement instead comes
+from the more mundane mechanism the paper actually specifies: BA no longer
+lets a handful of genuinely bad correspondences corrupt otherwise-good
+poses/points, and any point that becomes unreliable as a result is now
+actually removed instead of staying in the map forever.
+
+**Net result:** both of #26's documented gaps are closed and measured
+fresh. The reprojection-error/scale-consistency checks are implemented
+exactly as ORB-SLAM2 specifies them, with an honestly-documented inherent
+limitation (epipolar-consistent depth collapse isn't and can't be caught by
+either check - only by the existing parallax test). BA outlier discarding
+is implemented per the paper's own two-checkpoint wording and demonstrably
+reaches `cull_low_observation_points` for the first time. Three real bugs
+were found and fixed before trusting any number here, the last of which
+(the flat-threshold regression) would have been easy to miss without
+running the required end-to-end evaluation and taking a >50% regression
+seriously instead of writing it off as "the paper's checks don't help on
+this sequence."
