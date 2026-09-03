@@ -135,6 +135,17 @@ class Map:
         # observes.
         self._keyframe_matched_frame_idx = {}
 
+        # §VI-E Local Keyframe Culling (#27): keyframe indices removed via
+        # remove_keyframe/cull_redundant_keyframes. Unlike points, there's
+        # no parallel numpy array here - keyframe count stays small enough
+        # (hundreds, not tens of thousands) that a plain set is simplest.
+        # keyframe_poses/keyframe_observations/keyframe_kp/keyframe_desc
+        # (all demo-local, outside this class) are NEVER reindexed either,
+        # for the same reason Map.points never is - keyframe indices are
+        # used as stable identifiers throughout (BA free/fixed keyframe
+        # ids, this Map's own _point_keyframes/_covisibility).
+        self.removed_keyframes = set()
+
     def __len__(self):
         return len(self.points)
 
@@ -453,6 +464,101 @@ class Map:
         """Number of distinct keyframes that have observed this point - O(1),
         the direct-query form §VI-B's culling rules need every keyframe."""
         return len(self._point_keyframes[point_idx])
+
+    def keyframe_active(self, kf_idx):
+        """Whether this keyframe has NOT yet been removed by §VI-E Local
+        Keyframe Culling (see remove_keyframe/cull_redundant_keyframes).
+        Callers that build free/fixed keyframe sets or final trajectory
+        output directly from keyframe_poses/keyframe_observations (rather
+        than through one of this Map's own graph-derived queries, which
+        already exclude a removed keyframe naturally once it has zero
+        remaining points/edges) must filter through this explicitly - see
+        mapping._run_global_ba's free_kfs and _demo's trajectory-output/
+        plotting filtering."""
+        return kf_idx not in self.removed_keyframes
+
+    def remove_keyframe(self, kf_idx):
+        """
+        §VI-E Local Keyframe Culling (#27): permanently remove a keyframe
+        from the map - unlinks it from every (still-active) point it
+        currently observes (via remove_observation, which also cascades
+        into that point's own §VI-B removal if doing so drops it to zero
+        observations - see remove_observation's docstring), then marks
+        kf_idx removed so covisible_keyframes/local_map_keyframes/
+        keyframe_points naturally stop returning it (its edges/point set
+        are now empty) and keyframe_active(kf_idx) reports False for
+        anything checking explicitly.
+
+        The caller is still responsible for calling
+        cull_low_observation_points afterward - unlinking kf_idx can drop
+        several OTHER points to below 3 observing keyframes without any of
+        them individually hitting zero (remove_observation's own immediate-
+        removal exception only fires at exactly zero), same division of
+        responsibility #33's BA-outlier-discard path already has
+        (mapping._discard_ba_outlier_observations/_cull_redundant_keyframes).
+
+        Unlike remove_points, kf_idx itself is never physically removed
+        from keyframe_poses/keyframe_observations/keyframe_kp/keyframe_desc
+        (all demo-local, outside this class) - see keyframe_active's
+        docstring for why those need their own explicit filtering.
+        """
+        for point_idx in list(self._keyframe_points.get(kf_idx, ())):
+            self.remove_observation(point_idx, kf_idx)
+        self.removed_keyframes.add(kf_idx)
+
+    def cull_redundant_keyframes(self, candidate_kfs, min_observers=3, redundancy_ratio=0.9):
+        """
+        §VI-E Local Keyframe Culling: discard a keyframe once at least
+        redundancy_ratio (paper: 90%) of its own observed, still-active
+        points are each ALSO observed - at the same or finer pyramid scale
+        - by at least min_observers (paper: 3) OTHER keyframes. "Same or
+        finer scale" means the other keyframe's own detection octave for
+        that point is <= this keyframe's octave for it (a smaller octave
+        number is less downsampled/more detailed - the same convention
+        used throughout this codebase: Map.d_min/d_max, match_against_
+        guided's PredictScale, triangulate()'s #33 scale-consistency
+        check). This is the paper's redundancy test, not a geometric
+        quality check - it exists purely to bound reconstruction/BA size
+        against near-duplicate viewpoints (e.g. a lingering camera), on the
+        premise that a redundant keyframe's information is already
+        preserved by the >=3 other keyframes covering the same points at
+        least as well.
+
+        candidate_kfs are evaluated one at a time, in the given order, and
+        each removal's effect is visible to whatever's checked next -
+        a keyframe removed earlier in this same call can no longer count
+        as a later candidate's "other observer", since remove_keyframe
+        unlinks it from every point it observed. Callers should exclude
+        keyframe 0 (the sole global-BA gauge anchor) and the current/most-
+        recently-inserted keyframe (needed intact as this round's tracking
+        reference) from candidate_kfs themselves - this method applies no
+        such protection on its own, and will happily remove either if asked.
+
+        Returns the list of keyframe indices actually removed (does NOT
+        call cull_low_observation_points - see remove_keyframe's docstring;
+        mapping._cull_redundant_keyframes wraps both together).
+        """
+        removed = []
+        for kf in candidate_kfs:
+            if kf in self.removed_keyframes:
+                continue
+            points = [p for p in self.keyframe_points(kf) if self.active[p]]
+            if not points:
+                continue
+            n_redundant = 0
+            for p in points:
+                octave_kf = self.observation_octave(p, kf)
+                other_kfs = self._point_keyframes[p] - {kf}
+                n_observers = sum(
+                    1 for other in other_kfs
+                    if self.observation_octave(p, other) <= octave_kf
+                )
+                if n_observers >= min_observers:
+                    n_redundant += 1
+            if n_redundant / len(points) >= redundancy_ratio:
+                self.remove_keyframe(kf)
+                removed.append(kf)
+        return removed
 
     def local_map_keyframes(self, seed_points, max_keyframes=30):
         """
@@ -833,13 +939,21 @@ def _run_global_ba(keyframe_poses, keyframe_observations, sparse_map, camera_mat
     """
     if len(keyframe_poses) < 2:
         return None
-    free_kfs = list(range(1, len(keyframe_poses)))
+    # §VI-E (#27) may have removed keyframes anywhere in [1, len(keyframe_poses))
+    # - keyframe_poses itself is never reindexed (see Map.keyframe_active's
+    # docstring), so this has to filter explicitly rather than assume every
+    # index in range is still live.
+    free_kfs = [k for k in range(1, len(keyframe_poses)) if sparse_map.keyframe_active(k)]
     fixed_kfs = [0]
     # keyframe_observations still carries stale entries for any point §VI-B
     # has since culled (Map.remove_points only cleans the Map's own
     # _keyframe_points/_covisibility, not this demo-local list) - filter
     # against sparse_map.active so a removed point can't leak back into a
-    # full-trajectory BA pass as a live constraint.
+    # full-trajectory BA pass as a live constraint. A removed keyframe's own
+    # keyframe_observations entry is already cleared to [] at removal time
+    # (see mapping._cull_redundant_keyframes), so it contributes nothing here
+    # regardless - the free_kfs filter above is what actually keeps it out of
+    # the solve itself.
     point_ids = sorted(
         {obs[0] for kf_obs in keyframe_observations for obs in kf_obs}
         & set(np.where(sparse_map.active)[0].tolist())
@@ -928,6 +1042,49 @@ def _discard_ba_outlier_observations(keyframe_observations, sparse_map, outlier_
             n_removed_immediately += 1
 
     return len(outlier_pairs), n_removed_immediately
+
+
+def _cull_redundant_keyframes(sparse_map, keyframe_observations, current_kf_idx,
+                               max_candidates=20, min_observers=3, redundancy_ratio=0.9):
+    """
+    §VI-E Local Keyframe Culling (#27): run Map.cull_redundant_keyframes
+    over current_kf_idx's covisibility-graph neighbors (most-shared-points-
+    first, capped to max_candidates - same rescoping reasoning
+    mapping._run_local_ba's own 20-neighbor cap already uses: a single
+    keyframe can have far more than that crossing the covisibility-graph's
+    shared-point threshold on a small or heavily-revisited scene, and
+    evaluating all of them every keyframe insertion is exactly the
+    unbounded-per-keyframe cost this feature exists to bound AGAINST), then
+    cleans up the demo-local keyframe_observations list for whatever got
+    removed (Map.remove_keyframe only touches the Map's own state - same
+    split #33's _discard_ba_outlier_observations already has to work
+    around) and cascades into cull_low_observation_points (§VI-B's ongoing
+    rule) for any point that dropped below 3 observing keyframes as a
+    result.
+
+    current_kf_idx itself and keyframe 0 are always excluded from
+    candidates - see Map.cull_redundant_keyframes' docstring for why.
+
+    Called once per keyframe insertion (both branches - bootstrap's is a
+    harmless no-op, since a freshly-bootstrapped map has no covisibility
+    history yet to evaluate), after this keyframe's own local BA/outlier-
+    discard pass, matching the issue's note that a keyframe's redundancy
+    fraction should be computed over the paper-standard (already point-
+    culled) point set, not one still including not-yet-culled points.
+
+    Returns (removed_keyframes, culled_points) - both lists of indices.
+    """
+    edges = sparse_map.covisible_keyframes(current_kf_idx)
+    candidates = sorted(edges, key=lambda k: edges[k], reverse=True)[:max_candidates]
+    candidates = [kf for kf in candidates if kf != 0 and kf != current_kf_idx]
+
+    removed = sparse_map.cull_redundant_keyframes(
+        candidates, min_observers=min_observers, redundancy_ratio=redundancy_ratio,
+    )
+    for kf in removed:
+        keyframe_observations[kf] = []
+    culled = sparse_map.cull_low_observation_points(current_kf_idx) if removed else []
+    return removed, culled
 
 
 def _validate_and_apply_ba(ba_result, keyframe_poses, keyframe_observations, sparse_map,
@@ -1487,6 +1644,25 @@ def _demo():
                               "observations, which then feeds Map.cull_low_observation_points "
                               "(§VI-B's ongoing rule, see bundle_adjustment.local_bundle_"
                               "adjustment/mapping._discard_ba_outlier_observations)")
+    parser.add_argument("--no-keyframe-cull", action="store_true",
+                         help="Disable §VI-E Local Keyframe Culling (for comparison/cost "
+                              "measurement)")
+    parser.add_argument("--keyframe-cull-ratio", type=float, default=0.9,
+                         help="Paper §VI-E: discard a keyframe once at least this fraction of "
+                              "its own observed points are each also observed, at the same or "
+                              "finer pyramid scale, by --keyframe-cull-min-observers other "
+                              "keyframes (default 0.9 = 90 percent, the paper's own figure)")
+    parser.add_argument("--keyframe-cull-min-observers", type=int, default=3,
+                         help="Paper §VI-E: minimum number of OTHER keyframes (at the same or "
+                              "finer pyramid scale) a point must be seen in to count as "
+                              "redundant for --keyframe-cull-ratio's fraction")
+    parser.add_argument("--keyframe-cull-max-candidates", type=int, default=20,
+                         help="Cap on how many of the current keyframe's covisibility-graph "
+                              "neighbors (most shared points first) are evaluated for §VI-E "
+                              "redundancy each keyframe insertion - bounds the added per-"
+                              "keyframe cost on a small or heavily-revisited scene, same "
+                              "reasoning as --new-point-max-covisible-keyframes/local BA's own "
+                              "20-neighbor cap")
     parser.add_argument("--global-ba-at-end", action="store_true",
                          help="After tracking completes, run one full bundle adjustment pass "
                               "over every keyframe and every map point (paper Appendix; offline "
@@ -1605,6 +1781,12 @@ def _demo():
     # tracked separately since it's the first trigger that can ever fire it.
     total_ba_outliers_discarded = 0
     total_culled_from_ba_outliers = 0
+    # §VI-E Local Keyframe Culling totals (#27) - total_culled_from_keyframe_
+    # cull is the further slice of total_culled_ongoing attributable to a
+    # keyframe removal cascading into a point dropping below 3 observing
+    # keyframes, distinct from #33's BA-outlier-triggered slice above.
+    total_keyframes_culled = 0
+    total_culled_from_keyframe_cull = 0
 
     # §V-D Track Local Map state: ref_kf_idx is the keyframe index backing
     # ref_kp/ref_desc/ref_R/ref_t (kept in lockstep with them below);
@@ -1781,6 +1963,15 @@ def _demo():
                                 )
                                 total_ba_outliers_discarded += n_ba_outliers
                                 total_culled_from_ba_outliers += n_ba_culled
+                            if not args.no_keyframe_cull:
+                                culled_kfs, culled_pts_kf = _cull_redundant_keyframes(
+                                    sparse_map, keyframe_observations, new_kf_idx,
+                                    max_candidates=args.keyframe_cull_max_candidates,
+                                    min_observers=args.keyframe_cull_min_observers,
+                                    redundancy_ratio=args.keyframe_cull_ratio,
+                                )
+                                total_keyframes_culled += len(culled_kfs)
+                                total_culled_from_keyframe_cull += len(culled_pts_kf)
                             n_keyframes += 1
                             is_keyframe = True
                             status = f"BOOTSTRAP ({int(valid.sum())} points seeded)"
@@ -2088,6 +2279,21 @@ def _demo():
                                     total_ba_outliers_discarded += n_ba_outliers
                                     total_culled_from_ba_outliers += n_ba_culled
 
+                                if not args.no_keyframe_cull:
+                                    culled_kfs, culled_pts_kf = _cull_redundant_keyframes(
+                                        sparse_map, keyframe_observations, new_kf_idx,
+                                        max_candidates=args.keyframe_cull_max_candidates,
+                                        min_observers=args.keyframe_cull_min_observers,
+                                        redundancy_ratio=args.keyframe_cull_ratio,
+                                    )
+                                    total_keyframes_culled += len(culled_kfs)
+                                    total_culled_from_keyframe_cull += len(culled_pts_kf)
+                                    if culled_kfs:
+                                        print(f"    [keyframe culling: removed keyframes "
+                                              f"{culled_kfs}, {len(culled_pts_kf)} point(s) "
+                                              f"newly dropped below 3 observing keyframes "
+                                              f"as a result]")
+
                                 if args.depth_densify:
                                     if depth_rows is None:
                                         depth_rows = scanline_rows(
@@ -2144,7 +2350,12 @@ def _demo():
                         depth_panel = cv2.resize(depth_panel, None, fx=scale, fy=scale)
                     panels.append(depth_panel)
 
-                positions = _keyframe_positions(keyframe_poses)
+                # §VI-E (#27): skip culled keyframes here too, same reasoning
+                # as the final trajectory-output/plot filtering below.
+                positions = _keyframe_positions([
+                    pose for i, pose in enumerate(keyframe_poses)
+                    if sparse_map.keyframe_active(i)
+                ])
                 if args.depth_densify:
                     # Cleaner plot when densifying: just the trajectory and
                     # the ML depth points it's meant to be compared against,
@@ -2210,6 +2421,13 @@ def _demo():
           f"discarded across all BA passes, {total_culled_from_ba_outliers} point(s) removed "
           f"by the ongoing <3-observing-keyframe rule as a direct result - previously "
           f"unreachable from any trigger (see #26/#33)]")
+    n_active_keyframes = sum(
+        1 for i in range(len(keyframe_poses)) if sparse_map.keyframe_active(i)
+    )
+    print(f"    [keyframe culling (paper VI-E): {total_keyframes_culled} keyframes removed "
+          f"({n_active_keyframes} active / {len(keyframe_poses)} total), "
+          f"{total_culled_from_keyframe_cull} point(s) removed by the ongoing "
+          f"<3-observing-keyframe rule as a direct result]")
     if args.depth_densify:
         print(f"{len(ml_points)} ML-depth points sampled (sanity-check plot only - "
               f"not part of the tracked map)")
@@ -2253,13 +2471,20 @@ def _demo():
                       f"(unchanged before==after if the result was rejected as implausible - "
                       f"see message above)]")
 
-    positions = _keyframe_positions(keyframe_poses)
+    # §VI-E (#27): keyframe_poses itself is never reindexed/shrunk (kept
+    # index-stable - see Map.keyframe_active's docstring), so the final
+    # trajectory output/plot has to filter out culled keyframes explicitly
+    # here, same as _run_global_ba's free_kfs above.
+    active_keyframe_poses = [
+        pose for i, pose in enumerate(keyframe_poses) if sparse_map.keyframe_active(i)
+    ]
+    positions = _keyframe_positions(active_keyframe_poses)
 
     os.makedirs(os.path.dirname(args.plot_output), exist_ok=True)
 
     if args.trajectory_output:
-        write_tum_trajectory(args.trajectory_output, keyframe_poses)
-        print(f"Saved TUM-format trajectory ({len(keyframe_poses)} keyframes) to "
+        write_tum_trajectory(args.trajectory_output, active_keyframe_poses)
+        print(f"Saved TUM-format trajectory ({len(active_keyframe_poses)} keyframes) to "
               f"{args.trajectory_output}")
 
     import matplotlib
