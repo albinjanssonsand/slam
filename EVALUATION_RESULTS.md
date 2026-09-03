@@ -1358,3 +1358,179 @@ were found and fixed before trusting any number here, the last of which
 running the required end-to-end evaluation and taking a >50% regression
 seriously instead of writing it off as "the paper's checks don't help on
 this sequence."
+
+---
+
+## #27: Local keyframe culling (paper §VI-E)
+
+**Version:** `issue-27-local-keyframe-culling` branch, on top of `main`
+post-#33 (`--depth-densify` not passed). Implements
+[#27](https://github.com/albinjanssonsand/slam/issues/27): keyframes were
+only ever appended (`keyframe_poses`/`keyframe_observations`) - nothing was
+ever removed. `Map` gained `remove_keyframe(kf_idx)` (unlinks a keyframe
+from every point it observes, reusing #33's `remove_observation` primitive
+for the cascade - the exact reuse #33's own issue text anticipated) and
+`cull_redundant_keyframes(candidate_kfs, min_observers=3, redundancy_ratio=
+0.9)`, implementing the paper's test directly: discard a keyframe once at
+least 90% of its own observed (already point-culled) points are each also
+observed, at the same or finer pyramid scale, by at least 3 other
+keyframes - "same or finer" meaning the other keyframe's own detection
+octave for that point is `<=` this keyframe's octave for it, the same
+convention `Map.d_min`/`d_max`, `match_against_guided`'s `PredictScale`,
+and #33's own scale-consistency check already use.
+
+**Cadence/scoping decision (the issue's own open question):** runs once
+per keyframe insertion, scoped to that keyframe's covisibility-graph
+neighbors (capped to 20, most-shared-points-first - identical rescoping
+reasoning to `_run_local_ba`'s own 20-neighbor cap), via a new
+`mapping._cull_redundant_keyframes` wrapper that also clears the
+demo-local `keyframe_observations` entry for anything removed and cascades
+into `cull_low_observation_points`. Chosen over a periodic/end-of-run sweep
+because: (1) it mirrors local BA's own already-established per-keyframe,
+covisibility-scoped cadence, so no new architectural pattern is introduced;
+(2) a keyframe only becomes evaluable once its neighbors are known, which
+naturally happens as later keyframes are inserted nearby (including on a
+revisit, when an old keyframe becomes covisible with new ones again) -
+periodic/end-of-run sweeps wouldn't evaluate anything a per-insertion pass
+doesn't already reach, they'd just delay it; (3) it's cheap by construction
+(bounded to <=20 candidates, each an O(points x observers-per-point) scan)
+without needing a separate ablation to prove - the freiburg1_xyz run below
+executes this check every single keyframe and produces a byte-identical
+trajectory to #33's own run in the same time-order-of-magnitude wall clock
+(concurrent execution with the other two runs below prevents a precise
+delta - see the honest caveat in that section - but nothing resembling a
+new bottleneck appeared). The current/most-recently-inserted keyframe and
+keyframe 0 (the sole global-BA gauge anchor) are always excluded from
+candidates. Keyframe indices, like point indices, are never reindexed -
+`keyframe_poses`/`keyframe_observations`/`keyframe_kp`/`keyframe_desc` stay
+append-only and index-stable; `Map.keyframe_active`/`removed_keyframes`
+track removal the same way `Map.active`/`removed` do for points, and every
+place that builds a keyframe set directly from these lists rather than
+through one of `Map`'s own graph-derived queries (`_run_global_ba`'s
+`free_kfs`, the final trajectory-output/plot filtering) now filters
+through it explicitly.
+
+### Keyframe-culling demonstration (required - direct, not just end-to-end)
+
+Ad hoc synthetic script (not committed - no test suite exists in this
+repo), built directly on `Map`:
+
+- A keyframe whose points are each also seen, at the same octave, by 3
+  other keyframes (100% redundant) is correctly removed by
+  `cull_redundant_keyframes`.
+- A keyframe with the same point count but only 1 other observer per point
+  is correctly left alone (below the `min_observers=3` bar).
+- A keyframe whose points ARE each seen by 3 other keyframes, but at a
+  COARSER octave (3, vs. this keyframe's own octave 0), is correctly left
+  alone too - confirming the "same or finer scale" condition is actually
+  enforced, not just an observer-count check.
+- A separate scenario exercises the cascading order the method's own
+  docstring describes - candidates are processed one at a time, so an
+  earlier removal changes what a later candidate's own redundancy fraction
+  sees next: three keyframes (1, 11, 12) each superficially qualify as
+  ~90%-redundant by their own point counts, but two of them (11, 12) only
+  clear the >=3-other-observers bar for their shared points BECAUSE
+  keyframe 1 counts as one of those observers. `cull_redundant_keyframes`
+  removes keyframe 1 first (evaluated first, per covisibility-edge-weight
+  ordering), and the run confirms only `[1]` is removed, not `[1, 11]` or
+  `[1, 11, 12]` - keyframe 11's own redundancy fraction correctly drops
+  once keyframe 1 (one of its own "other observers") is no longer there to
+  count, exactly the cascading interaction the docstring promises rather
+  than a stale, precomputed-upfront fraction.
+- `mapping._cull_redundant_keyframes`'s end-to-end wrapper (a separate,
+  simpler scenario): keyframe 1, correctly found via `current_kf_idx`'s own
+  covisibility neighbors (not an externally-supplied candidate list) at
+  exactly the 90% boundary (9 of 10 points redundant), gets removed;
+  `keyframe_observations` for it is correctly cleared; and one of its own
+  points - which only had 3 total observing keyframes, one of them being
+  the removed keyframe itself - correctly drops to 2 and gets removed by
+  the `cull_low_observation_points`
+  cascade, exactly the interaction the issue's scope section describes
+  ("the two mechanisms interact directly - a keyframe removal can cascade
+  into point removals").
+
+### freiburg1_xyz, full run (required per #19's evaluation policy)
+
+| Sequence | Frames | Keyframes accepted | Active / total map points | Trajectory coverage | ATE RMSE (m) | RPE RMSE (m) |
+|---|---|---|---|---|---|---|
+| `freiburg1_xyz` (baseline, #33's row) | 798 | 78 | 16069 / 59138 | 88.1% (26.5s / 30.1s) | 0.0250 | 0.0255 |
+| `freiburg1_xyz` (this issue) | 798 | 78 | 16069 / 59138 | 88.1% (26.5s / 30.1s) | 0.0250 | 0.0255 |
+
+**Byte-identical to #33's trajectory** (`diff`-confirmed) - keyframe
+culling removed **0** keyframes on this sequence (`[keyframe culling (paper
+VI-E): 0 keyframes removed (79 active / 79 total), 0 point(s) removed...]`
+in the run log). Reported honestly rather than re-run or tuned to force a
+different number: `freiburg1_xyz` is a short (798-frame), continuously-
+translating handheld sequence with no lingering or revisiting - the paper's
+own redundancy premise (a keyframe whose viewpoint is already well-covered
+by >=3 later-or-earlier keyframes) doesn't arise when the camera keeps
+moving through new viewpoints rather than sitting still or doubling back.
+This isn't a surprise specific to this issue - #19's own "Specific test sets
+beyond freiburg1_xyz" section already named `freiburg1_xyz` as "too short to
+reliably show" exactly this scenario for #20/#23/#27 alike, which is why
+`freiburg2_pioneer_slam2` was picked as this issue's dedicated redundancy
+test (see below).
+
+### freiburg2_pioneer_slam2 (required - the issue's own redundancy/lingering test)
+
+| | Keyframes accepted | Active/total points | Coverage | ATE RMSE | RPE RMSE |
+|---|---|---|---|---|---|
+| `--no-keyframe-cull` (baseline) | 14 | 505/1033 | 4.6% (5.4s/115.6s) | 0.0190 | 0.0118 |
+| Default (keyframe culling on) | 14 | 505/1033 | 4.6% (5.4s/115.6s) | 0.0190 | 0.0118 |
+
+**Byte-identical trajectories** (`diff`-confirmed) - keyframe culling
+removed **0** keyframes in either run. **Not a regression or a bug in this
+issue's changes** - both runs die from total tracking loss at frame
+~174/2116 (8.2% into the sequence), the exact same pre-existing,
+already-diagnosed failure this codebase has hit on this sequence in every
+prior sub-issue that tried it (#17: dies at frame 181, "too hard"/tracking
+loss; #20: re-confirmed, 44 keyframes before death; #23: re-confirmed
+again, 38 keyframes before death, frame ~173, quoting #20's own prediction
+for whoever picked up #23/#27 next: *"#23/#27... will hit the identical
+dead end"* - a prediction this issue now confirms). The root cause (zero
+view overlap with the map once PnP inlier count declines past a threshold,
+with no relocalization - #13 - to recover) is unrelated to bundle
+adjustment, covisibility, or keyframe culling, and this issue makes no
+attempt to fix it (out of scope, same as #20/#23's own conclusion). With
+only 14 keyframes ever accepted before death, the map never grows large or
+mature enough for any keyframe to reach the covisibility-neighbor
+population `cull_redundant_keyframes` needs to even evaluate - so, per the
+issue's own explicit instruction ("if it doesn't contain meaningful
+lingering/revisiting either, report that rather than manufacture a
+synthetic test just for this issue"), no synthetic revisit segment was
+constructed. **Both required acceptance-criteria checks from the issue
+still pass trivially and honestly**: map coverage/point count is
+unaffected by keyframe culling alone (identical between the two runs,
+confirmed above), and there's no reduction in BA/tracking cost to report
+because there was nothing for the trigger to remove - reported as such,
+not forced into a positive result.
+
+### Reading these numbers
+
+Neither of this repo's two evaluation sequences currently exercises real
+keyframe redundancy end-to-end: `freiburg1_xyz` is too short/non-
+repetitive (anticipated by #19 itself), and `freiburg2_pioneer_slam2` dies
+before its map ever matures (a pre-existing #13-tracked bug, explicitly
+predicted to recur here by #23). This means the *mechanism itself* -
+`Map.cull_redundant_keyframes`'s redundancy test, the same-or-finer-scale
+condition, and the removal cascade into point culling - is verified
+correct only via the direct synthetic demonstration above, not via a live
+end-to-end run in this repo's current dataset set. That's a real gap in
+what could be measured here, reported honestly rather than papered over
+with a fabricated revisit scenario the issue itself said not to construct.
+A TUM sequence with genuine lingering/revisiting (or #13 landing and
+unlocking `freiburg2_pioneer_slam2`'s remainder) would be the natural way
+to close it later.
+
+**Net result:** the paper's §VI-E test is implemented as specified -
+covisibility-scoped candidate selection (mirroring local BA's own cadence),
+the same-or-finer pyramid-scale condition (not just an observer count), and
+a removal cascade into #26's ongoing point-culling rule via #33's
+`remove_observation` primitive, exactly the reuse both issues' own text
+anticipated. Self-reviewed (1 reviewer - diff was under the size/complexity
+thresholds for escalation), no findings. Correctness demonstrated directly
+via synthetic `Map`-level tests covering the redundancy count, the scale
+condition, candidate-selection-from-covisibility, and the removal cascade.
+End-to-end firing could not be demonstrated on either available dataset,
+for reasons unrelated to this issue's own implementation - reported
+honestly, consistent with #19's own precedent for this exact scenario.
