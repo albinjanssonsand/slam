@@ -25,11 +25,13 @@ def triangulate(R1, t1, R2, t2, camera_matrix, pts1, pts2, min_parallax_deg=1.0)
 
     Points collapsing to an implausibly CLOSE depth (the opposite-direction
     failure of the same instability, which this angle check alone doesn't
-    catch) are no longer filtered here - that's now handled upstream by
-    requiring independent re-observation before a point is trusted (see
-    mapping.Map's provisional/confirmed point lifecycle), which is a more
-    general check: it also catches whole-batch pose bias that a per-point
-    geometric heuristic can't.
+    catch) are not filtered here. Note this isn't caught downstream either:
+    mapping.Map's §VI-B culling (see cull_new_points) only checks
+    re-observation frequency/keyframe count, not geometric plausibility, so
+    a systematically-biased-but-internally-self-consistent triangulated
+    batch can satisfy it easily (its points keep matching each other's own
+    bias). No geometric sanity check currently exists for this failure mode
+    anywhere in the pipeline.
     """
     P1 = camera_matrix @ np.hstack([R1, t1])
     P2 = camera_matrix @ np.hstack([R2, t2])

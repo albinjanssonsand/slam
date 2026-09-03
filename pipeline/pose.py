@@ -82,15 +82,13 @@ def median_parallax(pts1, pts2):
     return float(np.median(np.linalg.norm(pts2 - pts1, axis=1)))
 
 
-def render_trajectory(positions, map_points=None, provisional_points=None, ml_points=None,
+def render_trajectory(positions, map_points=None, ml_points=None,
                        size=600, margin=40):
     """
     Render the top-down (X, Z) camera trajectory + sparse map into a BGR image.
 
-    map_points are drawn black (confirmed/trusted); provisional_points, if
-    given, are drawn orange - unconfirmed points awaiting independent
-    re-observation before being trusted. A point moves from one to the other
-    automatically across frames as its confirmed status changes upstream.
+    map_points, if given, are drawn black - the current sparse map (already
+    excludes any point removed by §VI-B culling, see Map.active).
     ml_points, if given, are drawn light blue - ML-depth-derived points (see
     pipeline/depth_ml.py), plotted for visual sanity-checking only; they are
     not part of the map used for pose estimation.
@@ -103,11 +101,6 @@ def render_trajectory(positions, map_points=None, provisional_points=None, ml_po
         if map_points is not None and len(map_points) > 0
         else np.empty((0, 2))
     )
-    prov_xz = (
-        np.asarray(provisional_points).reshape(-1, 3)[:, [0, 2]]
-        if provisional_points is not None and len(provisional_points) > 0
-        else np.empty((0, 2))
-    )
     ml_xz = (
         np.asarray(ml_points).reshape(-1, 3)[:, [0, 2]]
         if ml_points is not None and len(ml_points) > 0
@@ -117,7 +110,7 @@ def render_trajectory(positions, map_points=None, provisional_points=None, ml_po
     if len(pos_xz) < 2:
         return canvas
 
-    all_xz = np.vstack([a for a in (pos_xz, map_xz, prov_xz, ml_xz) if len(a)])
+    all_xz = np.vstack([a for a in (pos_xz, map_xz, ml_xz) if len(a)])
     # Percentile bounds rather than literal min/max - a single outlier point
     # (e.g. an ML-depth point that's still somewhat off despite the upstream
     # sanity checks) would otherwise dictate the whole canvas's scale on its
@@ -143,10 +136,8 @@ def render_trajectory(positions, map_points=None, provisional_points=None, ml_po
 
     for p in ml_xz:
         cv2.circle(canvas, to_canvas(p), 1, (139, 0, 0), -1)  # dark blue - ML depth (unverified)
-    for p in prov_xz:
-        cv2.circle(canvas, to_canvas(p), 2, (0, 165, 255), -1)  # orange (BGR) - provisional
     for p in map_xz:
-        cv2.circle(canvas, to_canvas(p), 2, (0, 0, 0), -1)  # black - confirmed
+        cv2.circle(canvas, to_canvas(p), 2, (0, 0, 0), -1)  # black - sparse map
 
     for i in range(1, len(pos_xz)):
         cv2.line(canvas, to_canvas(pos_xz[i - 1]), to_canvas(pos_xz[i]), (60, 60, 60), 2)
