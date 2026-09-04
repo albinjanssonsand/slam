@@ -157,7 +157,14 @@ def detect_and_compute_gridded(image, n_features=2000, grid=(4, 4), fallback_thr
 
 def match_descriptors(desc1, desc2, ratio=0.75):
     """
-    Brute-force Hamming matching with Lowe's ratio test.
+    Brute-force Hamming matching with Lowe's ratio test, followed by a
+    mutual-nearest-neighbor cross-check: a forward match desc1[i]->desc2[j]
+    is kept only if desc2[j]'s own best match in desc1 is also i. The ratio
+    test alone only asks "is the best candidate much better than the
+    second-best," which repetitive/low-distinctiveness texture (desk edges,
+    wallpaper, room corners) can pass easily even when the match is wrong;
+    cross-check catches many of those since a wrong match's target usually
+    has some other, unrelated descriptor as its own true nearest neighbor.
     Returns a list of cv2.DMatch, sorted by distance (best first).
     """
     if desc1 is None or desc2 is None or len(desc1) < 2 or len(desc2) < 2:
@@ -173,6 +180,14 @@ def match_descriptors(desc1, desc2, ratio=0.75):
         m, n = pair
         if m.distance < ratio * n.distance:
             good.append(m)
+
+    if not good:
+        return []
+
+    reverse_best = np.full(len(desc2), -1, dtype=int)
+    for m in matcher.match(desc2, desc1):
+        reverse_best[m.queryIdx] = m.trainIdx
+    good = [m for m in good if reverse_best[m.trainIdx] == m.queryIdx]
 
     good.sort(key=lambda m: m.distance)
     return good
