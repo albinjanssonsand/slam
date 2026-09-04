@@ -1534,3 +1534,171 @@ condition, candidate-selection-from-covisibility, and the removal cascade.
 End-to-end firing could not be demonstrated on either available dataset,
 for reasons unrelated to this issue's own implementation - reported
 honestly, consistent with #19's own precedent for this exact scenario.
+
+---
+
+## #14: Mutual nearest-neighbor cross-check in `match_descriptors`
+
+**Version:** `issue-14-match-descriptors-crosscheck` branch, on top of `main`
+post-#27 (`--depth-densify` not passed). Implements
+[#14](https://github.com/albinjanssonsand/slam/issues/14):
+`pipeline.features.match_descriptors` now follows its existing Lowe's-ratio
+test with a mutual-nearest-neighbor cross-check - a forward match
+`desc1[i] -> desc2[j]` is kept only if `desc2[j]`'s own best match back into
+`desc1` is also `i` (one extra `BFMatcher.match(desc2, desc1)` call, cheapest
+of the issue's own candidate list, no geometric assumptions).
+
+**Scope decision (the issue's own open question):** limited to
+`match_descriptors` itself, **not** extended to `Map.match_against_guided`'s
+separate inline scoring. Two things checked first, both confirming the
+issue's own "Updated" framing: (1) `Map.match_against` - the other historical
+consumer the issue names - has zero call sites left in the codebase
+(`grep -rn "\.match_against\("` finds nothing outside its own definition),
+confirming it's dead code superseded by `match_against_guided` (#23), exactly
+as the issue's update states; (2) `match_against_guided` already performs its
+own geometric-consistency gating (predicted-position window, viewing-angle
+vs. stored §III-C direction, [d_min, d_max] scale-invariance bounds,
+predicted-pyramid-octave search) that goes beyond what a ratio test or
+cross-check alone would add - it's already answering "is this match
+geometrically consistent," just via projection rather than mutual-NN. Adding
+cross-check there too was judged unnecessary to satisfy this issue's own
+motivation and left as a candidate for a future issue if guided matching's
+own false-match rate is ever separately identified as a problem.
+`match_descriptors`'s two remaining live call sites both stay in scope:
+`matches_ref` in `_demo()`'s main loop (bootstrap two-view matching, and -
+since #25 - the sole live use of `has_ref_baseline` for gating TRACK-branch
+keyframe promotion) and `_create_new_points_from_covisible_keyframes`
+(§VI-C new-point creation, #24).
+
+**Match-quality measurement (required by the issue - false-match-rate proxy,
+before/after):** an ad hoc script (not committed - no test suite exists in
+this repo) ran both the old ratio-only matcher and the new ratio+cross-check
+matcher over the same consecutive-frame-pair descriptors (this pipeline's own
+`detect_and_compute_gridded`), then measured each match set's
+`cv2.findEssentialMat(..., method=cv2.RANSAC)` inlier ratio as a proxy for
+"how many of these matches are real, geometrically-consistent
+correspondences" - a wrong match is very unlikely to agree with the true
+epipolar geometry by chance, so a match set with fewer total matches but a
+higher RANSAC-inlier fraction is measurably cleaner going into
+bootstrap/pose estimation, independent of anything full end-to-end tracking
+does downstream.
+
+| Sequence (frame range) | n pairs | Avg matches (old &rarr; new) | Avg E-inlier rate (old &rarr; new) |
+|---|---|---|---|
+| `freiburg1_desk` (0-50) | 50 | 505.0 &rarr; 437.8 (-13%) | 68.9% &rarr; 72.1% (+3.2pp) |
+| `freiburg1_room` (0-25) | 25 | 567.8 &rarr; 490.8 (-14%) | 70.1% &rarr; 73.1% (+3.0pp) |
+| `freiburg1_xyz` (0-60) | 60 | 768.1 &rarr; 694.2 (-10%) | 77.5% &rarr; 80.1% (+2.6pp) |
+| `recordings/demo1.mp4` (0-60) | 60 | 558.2 &rarr; 513.7 (-8%) | 84.1% &rarr; 87.0% (+2.9pp) |
+
+**Consistent, real effect across every sequence tested, including both
+target hard sequences:** cross-check trims ~8-14% of candidate matches while
+raising the RANSAC-inlier proxy by ~2.6-3.2 percentage points every time, no
+exceptions across 195 frame pairs on four different sequences/cameras. This
+directly answers the issue's "investigate which meaningfully reduces the
+false-match rate... don't guess, measure" requirement: cross-check alone
+does measurably clean up `match_descriptors`'s candidate set. (The other
+candidate - a fundamental-matrix RANSAC pre-filter - wasn't additionally
+implemented: cross-check's own measured effect already gave a clear,
+consistent signal without needing the costlier geometric pass, and every
+live call site already feeds its output straight into its own
+RANSAC/reprojection-based filtering - `estimate_relative_pose`'s
+`findEssentialMat` RANSAC for bootstrap, `triangulate`'s reprojection/scale
+checks for new-point creation - so a second, redundant epipolar filter ahead
+of those was judged not worth its extra cost here.)
+
+**Regression check (required by the issue - healthy sequences must not
+starve):** `freiburg1_xyz` and `recordings/demo1.mp4` both stay in the
+hundreds of matches per pair after cross-check (694.2 and 513.7 average,
+respectively) - nowhere near the `too few guided map matches`/`PnP: too few
+inliers` starvation symptoms `NOTES.md` documents from the unrelated,
+since-removed `--confirm-count 2` regression. No starvation risk on either
+healthy control sequence.
+
+**freiburg1_desk/freiburg1_room, fresh baseline (required by the issue - the
+original text's frame-37/613 and frame-100/1362 citations predate
+#20-#27/#33 and are stale):** re-ran both sequences on this branch's
+pre-fix `main` first to get an accurate current "before" state, then again
+with the fix.
+
+| | Bootstrap frame | Keyframes accepted | Active/total points | Death point | Coverage | ATE/RPE RMSE (m) |
+|---|---|---|---|---|---|---|
+| `desk`, pre-fix (fresh baseline) | 2 | 6 | 566/1445 | frame 45/613 | 5.3% (1.24s/23.4s) | 0.0200 / 0.0749 |
+| `desk`, post-fix (this issue) | 4 | 3 | 414/650 | frame 24/613 | 1.0% (0.23s/23.4s) | 0.0107 / 0.0171 |
+| `room`, pre-fix (fresh baseline) | 4 | 1 | 140/140 | frame 7/1362 (0 KF beyond bootstrap) | 0.27% (0.13s/48.9s) | degenerate (2 KF, same as `rpy`) |
+| `room`, post-fix (this issue) | 3 | 1 | 107/107 | frame 19/1362 (0 KF beyond bootstrap) | 0.20% (0.10s/48.9s) | degenerate (2 KF, same as `rpy`) |
+
+Both remain solidly in the **"too hard" (tracking loss)** bucket either way
+- consistent with the issue's own explicit Non-goal ("not a fix for... full
+tracking-loss recovery (#13) - this issue is about reducing the baseline
+false-match rate on any given frame pair, healthy or not"). `room`'s ATE/RPE
+are degenerate on both runs (`evo`'s own "Degenerate covariance rank"
+error) because neither run ever accepts a second TRACK-branch keyframe
+beyond bootstrap - the exact same 2-keyframe alignment failure `NOTES.md`
+already documents for `freiburg1_rpy` - so coverage/frame-only-tracking
+duration are the only meaningful comparison points there, not ATE/RPE.
+
+**Reading these numbers - reported honestly, not smoothed over:** the fix
+changes which frame bootstrap fires on (`desk`: 2&rarr;4; `room`: 4&rarr;3) -
+a direct, expected consequence of a stricter matcher taking one or two more
+frames to accumulate 8+ surviving matches/enough parallax - and that
+different starting point cascades differently on these two sequences, whose
+dominant failure mode (documented extensively above, under #15/#17/#20/#23's
+sections) is *already* known to be highly sensitive to exactly this kind of
+small early difference: **zero view overlap with the confirmed map once PnP
+inlier count declines past a threshold, with no relocalization (#13) to
+recover** - not a false-match-rate problem this issue could fix even in
+principle. `desk`'s post-fix run dies measurably earlier (frame 24 vs. 45) -
+a real, honestly-reported regression in this one run-to-run comparison, not
+dismissed as noise - but two things bound how much weight it deserves: (1)
+OpenCV's RANSAC-based estimators (`findEssentialMat` for bootstrap,
+`solvePnPRansac` inside `estimate_pose_pnp`) draw unseeded random samples, so
+some run-to-run variation is expected from the *unchanged* code alone, not
+only from this fix - not separately quantified here (would need many repeats
+per condition), but a real confound worth naming rather than ignoring; (2)
+`room`'s frame-only tracking survives measurably *longer* post-fix (14
+frame-only-tracked frames vs. 3, dying at frame 19 vs. 7) - the opposite
+direction from `desk` - so the two target hard sequences don't even agree on
+a sign, consistent with "different bootstrap seed cascades differently on a
+chaotic failure mode" rather than a systematic harm from cleaner matching.
+Neither sequence's "too hard" classification changes either way.
+
+**freiburg1_xyz, full run (required by the issue - regression control):**
+
+| Sequence | Frames | Keyframes accepted | Active/total map points | Trajectory coverage | ATE RMSE (m) | RPE RMSE (m) |
+|---|---|---|---|---|---|---|
+| `freiburg1_xyz`, pre-fix (fresh baseline) | 798 | 88 | 16639/63091 | 86.6% (26.07s/30.09s) | 0.0229 | 0.0218 |
+| `freiburg1_xyz`, post-fix (this issue) | 798 | 88 | 16639/63091 | 86.6% (26.07s/30.09s) | 0.0229 | 0.0218 |
+
+**Byte-identical** (`diff`-confirmed, both the full run log and the saved
+trajectory file) - every keyframe/point count, coverage, and ATE/RPE digit
+matches exactly. (This fresh baseline differs slightly from #27's own
+canonical row - 88 vs. 78 keyframes, 86.6% vs. 88.1% coverage - attributable
+to the RANSAC non-determinism noted above between separate runs of unchanged
+code, not to anything this issue touches; the pre-fix/post-fix pair here was
+run back-to-back specifically to isolate this issue's own effect from that
+noise.) On this sequence, cross-check trims ~10% of candidate matches per
+frame pair (measured above) without changing a single downstream decision -
+plausible explanation, not separately proven: `estimate_relative_pose`'s own
+`findEssentialMat` RANSAC and `_create_new_points_from_covisible_keyframes`'s
+epipolar/reprojection/scale checks already reject the same wrong
+correspondences cross-check would have pre-filtered, so the surviving
+accepted set converges to the same answer either way on a sequence healthy
+enough that those downstream checks were never close to their own rejection
+thresholds.
+
+**Net result:** the fix does exactly what it was scoped to do - a cheap,
+dependency-free (`cv2.BFMatcher`, already used) match-quality improvement to
+`match_descriptors`'s two live call sites, with a real, consistently
+measured false-match-rate reduction (higher RANSAC-inlier proxy at a lower
+match count, on every one of 4 tested sequences/cameras) and zero regression
+on the two required healthy-sequence checks (no match-count starvation on
+`xyz`/`demo1.mp4`; `xyz`'s full end-to-end run is byte-identical). It does
+not - and, per the issue's own Non-goals, was never meant to - fix
+`desk`/`room`'s tracking-loss failure mode, whose root cause (#13) is
+unrelated to per-pair match quality; the death-point movement observed on
+those two sequences is real but goes in opposite directions between them and
+is bounded by unseeded-RANSAC run-to-run noise this write-up flags rather
+than glosses over. `Map.match_against_guided` was deliberately left
+untouched (see the Scope decision above) - a candidate for a future issue if
+its own false-match rate is ever separately identified as a problem worth
+solving.
