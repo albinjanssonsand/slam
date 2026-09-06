@@ -1503,6 +1503,8 @@ def _extend_new_points_to_other_covisible_keyframes(
 
 def _demo():
     import argparse
+    import time
+    from collections import Counter
 
     from capture.video_source import open_calibrated_source
     from pipeline.depth_ml import DepthEstimator, colorize_depth_with_background, scanline_rows
@@ -1626,6 +1628,33 @@ def _demo():
                               "put the camera in the wrong place, which the rotation check "
                               "alone won't catch (and which then corrupts every subsequent "
                               "frame's rotation-vs-previous comparison once accepted)")
+    parser.add_argument("--relocalize", action="store_true",
+                         help="Attempt relocalization (#13) once per-frame PnP tracking has "
+                              "failed for --relocalize-after-frames consecutive frames: match "
+                              "this frame's descriptors against the ENTIRE active map (Map."
+                              "match_against, no predicted-pose window) instead of the guided/"
+                              "local-map search normal tracking uses, then attempt PnP+RANSAC "
+                              "fresh with no assumption of a nearby previous pose. On success, "
+                              "resumes ordinary per-frame tracking from the recovered pose - not "
+                              "a separate code path. Off by default: a sequence whose own tracking "
+                              "never goes --relocalize-after-frames consecutive frames without an "
+                              "accepted pose makes zero extra calls either way, so it's an exact "
+                              "no-op there - but one that DOES cross that threshold, even on an "
+                              "otherwise-transient gap that would have self-recovered on its own a "
+                              "few frames later anyway (measured on freiburg1_xyz - see "
+                              "EVALUATION_RESULTS.md), will make at least one extra cv2.solvePnPRansac "
+                              "call. Since OpenCV's RANSAC estimators draw from process-global RNG "
+                              "state rather than a call-local one, that extra call shifts every "
+                              "later RANSAC-based estimate for the rest of the run away from a "
+                              "flag-off baseline - not a logic change, but a real, measured "
+                              "divergence, not just a performance cost")
+    parser.add_argument("--relocalize-after-frames", type=int, default=5,
+                         help="Consecutive per-frame tracking failures before --relocalize "
+                              "attempts a wide-search relocalization - avoids paying the full-map "
+                              "search's cost on a single skipped frame guided matching would "
+                              "likely recover from on its own next frame (see "
+                              "n_consecutive_untracked, which also drives match_against_guided's "
+                              "own search-radius widening)")
     parser.add_argument("--ba-every", type=int, default=1,
                          help="Only run local bundle adjustment every Nth accepted keyframe "
                               "(default: every keyframe)")
@@ -1772,6 +1801,14 @@ def _demo():
     n_keyframes = 0
     n_tracked_only = 0
     n_skipped = 0
+    # #13 relocalization totals - n_relocalize_attempts includes failed
+    # attempts (not enough full-map matches, PnP failed, or too few inliers),
+    # n_relocalized is the subset that succeeded; total_relocalize_time is
+    # wall-clock across every attempt (success or not), for reporting the
+    # wide full-map search's per-attempt cost.
+    n_relocalize_attempts = 0
+    n_relocalized = 0
+    total_relocalize_time = 0.0
     # §VI-B culling totals across the whole run, for the final report.
     total_culled_trial = 0
     total_culled_ongoing = 0
@@ -2322,6 +2359,131 @@ def _demo():
                                       f"{pnp_inliers}/{len(map_indices)} PnP inliers "
                                       f"(frame-only, not a keyframe)")
 
+                # --- Relocalization (#13): ordinary guided tracking above
+                # has now failed --relocalize-after-frames frames in a row -
+                # try a wide, unguided search against the ENTIRE active map
+                # (Map.match_against, no predicted-pose window) rather than
+                # the local/guided one that's already failing, then attempt
+                # PnP+RANSAC fresh. Deliberately does NOT run the rotation-
+                # vs-previous-frame/step-vs-recent-median plausibility checks
+                # normal tracking does - those assume continuity with the
+                # last accepted pose, which relocalization by definition
+                # doesn't have (that's the whole reason ordinary tracking
+                # just spent --relocalize-after-frames frames failing). The
+                # same PnP+RANSAC inlier bar (--pnp-min-inliers) ordinary
+                # tracking itself requires is what validates this pose
+                # instead. Not attempted every frame once lost - only after
+                # the threshold - since a full-map search is real added cost
+                # a single skipped frame (which guided matching often
+                # recovers from on its own) shouldn't have to pay.
+                if (
+                    not track_accepted and args.relocalize
+                    and n_consecutive_untracked >= args.relocalize_after_frames
+                ):
+                    n_relocalize_attempts += 1
+                    reloc_start = time.perf_counter()
+                    reloc_map_indices, reloc_frame_indices = sparse_map.match_against(
+                        desc, ratio=args.ratio,
+                    )
+                    if len(reloc_map_indices) >= 6:
+                        reloc_object_points = sparse_map.points[reloc_map_indices]
+                        reloc_image_points = np.float32(
+                            [kp[i].pt for i in reloc_frame_indices]
+                        )
+                        reloc_result = estimate_pose_pnp(reloc_object_points, reloc_image_points, K)
+                        if reloc_result is not None:
+                            R_reloc, t_reloc, reloc_inlier_mask = reloc_result
+                            reloc_inliers = int(reloc_inlier_mask.sum())
+                            if reloc_inliers >= args.pnp_min_inliers:
+                                track_accepted = True
+                                n_relocalized += 1
+                                n_tracked_only += 1
+                                status = (
+                                    f"RELOCALIZED ({reloc_inliers}/{len(reloc_map_indices)} "
+                                    f"PnP inliers)"
+                                )
+                                print(
+                                    f"frame {frame.index}: RELOCALIZED  "
+                                    f"{reloc_inliers}/{len(reloc_map_indices)} PnP inliers  "
+                                    f"(full-map search, after {n_consecutive_untracked} "
+                                    f"consecutive lost frames)"
+                                )
+                                last_tracked_map_indices = reloc_map_indices[reloc_inlier_mask]
+                                # No constant-velocity carry-over into the next
+                                # frame - the recovered pose has no known
+                                # velocity, and extrapolating whatever motion
+                                # was last observed before the loss would
+                                # extrapolate across the whole lost stretch,
+                                # not one frame (predict_constant_velocity's
+                                # own gap-check would already reject this via
+                                # prev_pose_frame/cur_pose_frame not being
+                                # exactly 1 apart - cleared here for clarity).
+                                prev_pose = None
+                                prev_pose_frame = None
+                                R_pos, t_pos = R_reloc, t_reloc
+                                cur_pose_frame = frame.index
+                                # Recent step-size history is from before the
+                                # loss, at whatever spatial scale/pace that
+                                # motion had - not a meaningful baseline for
+                                # --max-step-ratio right after a jump to a
+                                # possibly-distant recovered location. Cleared
+                                # so that check's own "len(recent_step_sizes)
+                                # >= 5" gate holds off enforcing it again until
+                                # enough post-recovery steps rebuild one.
+                                recent_step_sizes.clear()
+                                # §V-E condition 1 (frames_since_relocalization)
+                                # exists specifically to withhold keyframe
+                                # promotion for --kf-min-frames-since-
+                                # relocalization frames after a relocalization
+                                # event, since the recovered pose hasn't been
+                                # refined by local BA yet - this is the first
+                                # time it's ever reset off its startup head
+                                # start. frames_since_last_keyframe is reset
+                                # alongside it so the unrelated --kf-max-
+                                # frames-since-keyframe fallback (which
+                                # bypasses condition 1 entirely) doesn't
+                                # immediately force a keyframe on the very
+                                # next frame purely because it kept counting
+                                # up through the whole lost stretch.
+                                frames_since_relocalization = 0
+                                frames_since_last_keyframe = 0
+                                # Re-anchor the plain (non-guided) reference-
+                                # frame match (has_ref_baseline/parallax, and
+                                # the baseline keyframe-promotion condition 4
+                                # compares against) to whichever EXISTING
+                                # keyframe shares the most of this
+                                # relocalization's own inlier points, instead
+                                # of leaving it pointed at the pre-loss
+                                # keyframe - otherwise has_ref_baseline could
+                                # stay false forever if the recovered location
+                                # is visually unrelated to that stale
+                                # reference, permanently blocking any future
+                                # keyframe (and therefore new structure) even
+                                # though per-frame tracking itself has
+                                # recovered.
+                                kf_votes = Counter()
+                                for pid in last_tracked_map_indices:
+                                    kf_votes.update(
+                                        k for k in sparse_map.observing_keyframes(int(pid))
+                                        if sparse_map.keyframe_active(k)
+                                    )
+                                if kf_votes:
+                                    best_kf = kf_votes.most_common(1)[0][0]
+                                    ref_kp, ref_desc = keyframe_kp[best_kf], keyframe_desc[best_kf]
+                                    ref_R, ref_t = keyframe_poses[best_kf].R, keyframe_poses[best_kf].t
+                                    ref_kf_idx = best_kf
+                                    # ref_kf_tracked_count is condition 4's baseline
+                                    # (how many points the reference tracked via PnP
+                                    # when IT was inserted) - best_kf is an existing
+                                    # keyframe being retroactively adopted as
+                                    # reference here, not one just freshly
+                                    # PnP-tracked, so there's no such figure for it;
+                                    # None makes condition 4 vacuously satisfied,
+                                    # exactly like a bootstrap-created reference,
+                                    # until a real PnP-tracked keyframe replaces it.
+                                    ref_kf_tracked_count = None
+                    total_relocalize_time += time.perf_counter() - reloc_start
+
                 n_consecutive_untracked = 0 if track_accepted else n_consecutive_untracked + 1
 
             if not args.no_display:
@@ -2417,6 +2579,14 @@ def _demo():
           f"{n_skipped} frames not promoted to a keyframe "
           f"({n_tracked_only} still tracked frame-only, "
           f"{n_skipped - n_tracked_only} lost tracking entirely)")
+    if args.relocalize:
+        avg_ms = (
+            1000 * total_relocalize_time / n_relocalize_attempts
+            if n_relocalize_attempts else 0.0
+        )
+        print(f"    [relocalization (#13): {n_relocalize_attempts} attempts, "
+              f"{n_relocalized} succeeded, {total_relocalize_time:.2f}s total "
+              f"({avg_ms:.1f}ms/attempt)]")
     print(f"    [BA outlier discard (paper VI-D): {total_ba_outliers_discarded} observations "
           f"discarded across all BA passes, {total_culled_from_ba_outliers} point(s) removed "
           f"by the ongoing <3-observing-keyframe rule as a direct result - previously "
