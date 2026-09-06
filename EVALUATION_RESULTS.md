@@ -1837,3 +1837,229 @@ rather than oversells. The one real surprise - `--relocalize` perturbing
 `freiburg1_xyz`'s accuracy despite "never triggering" being false for that
 sequence - is reported honestly rather than hidden behind a rerun chosen to
 avoid it.
+
+---
+
+## #22: Automatic dual-model (homography/fundamental) initialization (paper §IV)
+
+**Version:** `issue-22-dual-model-initialization` branch, on top of `main`
+post-#13. Implements
+[#22](https://github.com/albinjanssonsand/slam/issues/22): replaces the
+bootstrap branch's essential-matrix-only two-view pose estimate
+(`pose.estimate_relative_pose` + `triangulation.triangulate`) with the
+paper's own automatic dual-model initialization (§IV) - a homography and a
+fundamental matrix are estimated in parallel over the SAME matches
+(`pose.estimate_homography`/`estimate_fundamental_matrix`), scored by
+symmetric transfer error (`pose.homography_score`/`fundamental_score`, Eq.
+2, T_H=5.99/T_F=3.84) and one is selected via the `R_H = S_H/(S_H+S_F) >
+0.45` heuristic (Eq. 3), then the selected model's motion hypotheses
+(`pose.decompose_homography`/`decompose_essential`) are disambiguated by
+directly triangulating each with the existing octave-aware
+`triangulation.triangulate` (#33) rather than trusting cheirality alone -
+picking whichever hypothesis triangulates the most in-front/high-parallax/
+low-reprojection-error points (`mapping._bootstrap_dual_model`), and
+refusing to initialize outright (mirrors ORB-SLAM2's own
+minTriangulated/0.9*N/0.7*best-vs-runner-up test) if no hypothesis is a
+clear winner. A one-shot full BA (`mapping._run_global_ba`, reusing #20's
+global-BA machinery) now runs unconditionally right after a successful
+bootstrap, before the two-view reconstruction is otherwise used (paper §IV
+step 5) - this replaces bootstrap's own previous per-keyframe local BA call
+specifically; the TRACK branch's ongoing local BA is unchanged.
+
+**A real scoring bug found and fixed along the way, before any number below
+was collected:** the first implementation's symmetric-transfer-error check
+combined both reprojection/epipolar-line directions into one squared error
+before testing it against a single threshold. ORB-SLAM2's own reference
+implementation of this exact equation (`CheckHomography`/`CheckFundamental`)
+scores EACH direction independently - a separate inlier test and a separate
+`gamma - d^2` reward per direction, not one combined check on their sum.
+`pose._symmetric_transfer_score`/`homography_score`/`fundamental_score` were
+rewritten to match. Also hardened `homography_score` against
+`cv2.findHomography` returning a numerically singular matrix - a real
+possibility on exactly the kind of degenerate/near-planar correspondence set
+this feature exists to handle - since an uncaught `LinAlgError` there would
+crash the whole run instead of falling through to "no dominant motion
+hypothesis"/keep accumulating frames, like every other bootstrap-rejection
+path already does.
+
+### freiburg3_nostructure_texture_far: the paper's own reference case (Table III)
+
+This TUM sequence (far, low-texture, near-planar structure) is the paper's
+own reference case where ORB-SLAM correctly detects a planar twofold
+ambiguity and refuses to initialize, where a naive essential-matrix-only
+bootstrap risks seeding a corrupted map - required by the issue to be
+tested **before and after**, to demonstrate the fix actually fixes
+something rather than adding an unexercised code path. Newly downloaded for
+this issue; not previously used anywhere in this file.
+
+**Before (main, essential-matrix-only bootstrap):** bootstraps at frame 12
+with 528 essential-matrix RANSAC inliers, seeding 526 points -
+`--min-parallax`/`--min-inliers` are satisfied and nothing else checks
+whether the correspondence set is actually well-conditioned. Confirmed
+likely corrupted rather than merely unverified: re-running this exact frame
+pair through the new dual-model diagnostic (below) shows only 14 of 1059
+RANSAC-inlier correspondences (1.3%) triangulate to a dominant,
+self-consistent 3D interpretation under ANY motion hypothesis - the old
+code's frame-12 reconstruction has no such safeguard and just trusts
+whichever pose `cv2.recoverPose`'s internal cheirality vote happened to pick.
+
+**After (this issue, dual-model bootstrap):** R_H stays in the 0.47-0.51
+range (homography favored - this scene genuinely looks planar to the
+heuristic) across every attempted frame from 5 through 42, correctly
+refusing to initialize the entire time, with "best" triangulated-hypothesis
+counts near zero out of ~1000 RANSAC inliers for most of that span (frame
+12 specifically: best 14/1059, matching the "before" diagnostic above).
+Starting frame 32 the best-hypothesis count climbs steadily (543/1009 ->
+736/915) as real parallax finally accumulates, and bootstrap is accepted at
+**frame 43**: model=H, R_H=0.47, 865 pose inliers, 798/865 (92.3%)
+triangulated as the dominant hypothesis - exactly the paper's documented
+alternate-success outcome ("if real parallax does eventually appear later
+in the sequence, correctly recovers non-planar structure"), not a flat
+"never initializes" outcome, and a fully evidenced improvement over the old
+code's unverified frame-12 guess.
+
+### freiburg1_xyz regression check (required by the issue)
+
+**Bootstrap still succeeds promptly:** frame 4, model=H, R_H=0.47,
+959/959 (100%) points seeded.
+
+| Sequence | Frames | Keyframes | Active/total points | Coverage | ATE RMSE (m) | RPE RMSE (m) |
+|---|---|---|---|---|---|---|
+| `freiburg1_xyz` (baseline - see note below) | 798 | 88 | 16639/63091 | 86.6% (26.07s/30.09s) | 0.0229 | 0.0218 |
+| `freiburg1_xyz` (this issue) | 798 | 95 | 13013/45049 | 86.2% (25.94s/30.09s) | 0.1129 | 0.1032 |
+
+**Baseline note:** the issue asks to compare against "#27's row, the most
+recently landed one" (798/78/16069-59138/88.1%/0.0250/0.0255) - but #14 and
+#13 both landed on `main` after #27 (see git log: #33 -> #27 -> #14 -> #13),
+and #13's own regression check re-confirmed #14's fresh post-fix row (88
+keyframes, 0.0229/0.0218) as `main`'s actual current-default-flags
+freiburg1_xyz behavior, unchanged by #13 itself. #27's row is therefore
+stale by two landed issues; #14/#13's row is what a fresh run of unmodified
+`main` actually produces today, so that's used as the honest "before" here -
+the same reasoning #13's own section already applied to `desk`/`room`'s
+stale frame-37/frame-100 citations.
+
+**This is a genuine, measured regression - not a bug, root-caused and
+reported per explicit user direction (see below) rather than silently
+shipped or masked by deviating from the paper's own pinned constants.** ATE
+RMSE roughly quintuples (0.0229 -> 0.1129) and RPE roughly quintuples too
+(0.0218 -> 0.1032), despite near-identical coverage (86.6% -> 86.2%) and
+MORE active keyframes (88 -> 95) than the baseline - so this isn't a
+tracking-loss/coverage story, it's the two-view bootstrap solve itself
+being measurably less accurate.
+
+**Root cause, verified against TUM ground truth:** freiburg1_xyz's actual
+bootstrap frame pair (frame 0 -> frame 4) is a borderline case for the R_H
+heuristic: R_H=0.469, just over the paper's 0.45 homography-selection
+threshold. Directly comparing the two candidate two-view rotations against
+the ground-truth relative rotation between the same two frame timestamps:
+
+| | Rotation (deg) | Error vs. ground truth |
+|---|---|---|
+| Ground truth (TUM mocap) | 2.590 | - |
+| OLD essential-matrix-only pose | 2.694 | 0.104 deg |
+| NEW homography-selected pose (R_H=0.469, model=H) | 1.367 | 1.223 deg (~12x worse) |
+
+The paper's R_H > 0.45 heuristic deliberately biases toward the "safer"
+homography model even in ambiguous cases, specifically to avoid
+essential-matrix corruption on a truly planar scene (exactly what protects
+`freiburg3_nostructure_texture_far` above). On `freiburg1_xyz` - a
+genuinely 3D desk scene whose very first few frames happen to present a
+borderline-planar-looking correspondence set - that same bias picks the
+measurably less accurate model, and that two-view pose error propagates
+through the whole subsequent PnP-tracked trajectory. This is inherent to
+implementing the paper's own Eq. 3 threshold exactly as specified (both
+this issue and the paper pin R_H > 0.45, T_H=5.99, T_F=3.84 as fixed
+constants, not tunables) - not fixable without deviating from the paper's
+own specification, which this issue explicitly requires following "exactly."
+
+**Explicitly surfaced to the user given the direct conflict with this
+issue's own "must not regress" acceptance criterion; decision: ship as
+specified, document honestly.** A tie-breaking triangulation-quality check
+near the R_H boundary, and investigating whether a different bootstrap
+frame pair would resolve it, were both offered and declined in favor of
+paper fidelity + transparent reporting - consistent with this file's own
+established practice (e.g. #13's "one real surprise ... reported honestly
+rather than hidden").
+
+### Model/R_H selection sanity check (required by the issue)
+
+| Sequence | Selected model | R_H | Scene character |
+|---|---|---|---|
+| `freiburg1_xyz` | H | 0.469 | Genuinely 3D desk scene - borderline case, see regression analysis above |
+| `freiburg3_nostructure_texture_far` | H (throughout the refusal window and at eventual acceptance) | 0.47-0.51 | Far, low-texture, near-planar - correctly trends toward homography |
+
+Both sequences trend toward homography, as expected for TUM's fr1/fr3
+desk-distance camera framing, but the two outcomes diverge exactly where
+they should: fr3's low parallax/planarity keeps every hypothesis
+un-dominant for 38 frames (correct refusal), while fr1's real,
+quickly-accumulating parallax gives every hypothesis - right or wrong - a
+clean-looking triangulation almost immediately (a homography-selected
+hypothesis self-consistently "explains" its own inlier correspondences even
+when it's the geometrically worse pick, since it was fit FROM them - see
+the regression analysis above for why "100% triangulated" isn't itself
+evidence of a *correct*, as opposed to merely self-consistent, pose).
+
+### Performance (required by the issue)
+
+Computing both models in parallel does NOT roughly double bootstrap-attempt
+cost as anticipated - measured directly (40 repeats, real freiburg1_xyz
+frame-pair correspondences, ~1000-1100 matches): essential-matrix-only
+(`estimate_relative_pose` + `triangulate`) averages ~17-21ms/attempt; the
+dual-model path (`_bootstrap_dual_model`: both RANSAC fits + both symmetric-
+transfer scores + up to 4 hypotheses each individually triangulated)
+averages ~13-14ms/attempt, about 0.7-0.8x the old cost. Plausible
+explanation: `cv2.findHomography`/`cv2.findFundamentalMat`'s RANSAC
+(reprojection-threshold-based) are individually cheaper than
+`cv2.findEssentialMat` + `cv2.recoverPose`'s own internal SVD/cheirality
+voting over every point; the extra hypothesis-triangulation work is
+apparently outweighed by that saving on this data. Either way, well within
+the issue's own "acceptable, this only runs during the brief initialization
+phase" expectation.
+
+### Confirming the root cause: forcing F-selection on freiburg1_xyz
+
+To more rigorously test the regression's root-cause diagnosis above (not
+shipped - a one-off diagnostic run, `_bootstrap_dual_model`'s
+`homography_select_threshold` default patched from 0.45 to 0.5 in-process,
+`main`'s pinned 0.45 is untouched in the committed code), re-ran
+`freiburg1_xyz` with the R_H heuristic biased toward the fundamental-matrix
+branch instead:
+
+| Config | Bootstrap frame | Model | Keyframes | Coverage | ATE RMSE (m) | RPE RMSE (m) |
+|---|---|---|---|---|---|---|
+| Old code (baseline) | 5 | essential | 88 | 86.6% | 0.0229 | 0.0218 |
+| New code, default (`R_H`>0.45) | 4 | H | 95 | 86.2% | 0.1129 | 0.1032 |
+| New code, `R_H`>0.5 (diagnostic only) | 12 | F | 85 | 86.3% | 0.0423 | 0.0381 |
+
+Forcing F-selection recovers most of the accuracy (ATE 0.1129 -> 0.0423,
+~2.7x better) at equivalent coverage - strong, end-to-end confirmation that
+H-vs-F model selection is the dominant driver of the regression, not
+something else this issue's change also touched. It doesn't fully return to
+the original 0.0229/0.0218, because raising the threshold doesn't just swap
+the model at the same frame: F's own hypothesis only becomes dominant 8
+frames later (frame 12, not frame 4), so this diagnostic run bootstraps off
+a different, later frame pair with sparser founding structure (607 points
+vs. 943-959) rather than an otherwise-identical reconstruction with only the
+model swapped - not a fully apples-to-apples comparison, but conclusive on
+the question it was run to answer.
+
+**Decision (re-confirmed):** ship with the paper's literal R_H>0.45 (not
+0.5 or any other tuned value) - this diagnostic exists to verify the
+regression's cause, not to argue for changing the shipped constant away
+from what the issue and the paper both specify exactly.
+
+### Net result
+
+The dual-model bootstrap works exactly as the paper intends on its own
+reference case (`freiburg3_nostructure_texture_far`): a demonstrated,
+before/after fix, not just a new code path that happened to never matter -
+the old essential-matrix-only bootstrap mis-initializes at frame 12 off a
+correspondence set that this issue's own diagnostic shows has almost no
+coherent 3D structure (14/1059), while the new code correctly refuses for
+38 frames and then recovers real structure once genuine parallax appears.
+The cost is a genuine, root-caused, and explicitly user-accepted regression
+on `freiburg1_xyz`, inherent to the paper's own R_H>0.45 threshold picking
+the "safe" model even on a borderline non-planar scene - reported
+transparently rather than masked by quietly deviating from the paper's
+pinned constants.

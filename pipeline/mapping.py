@@ -753,6 +753,130 @@ def estimate_pose_pnp(object_points, image_points, camera_matrix):
     return R, tvec, inlier_mask
 
 
+def _bootstrap_dual_model(ref_kp, kp, matches, pts1, pts2, camera_matrix,
+                           min_pose_inliers, min_triangulation_angle,
+                           pyramid_scale_factor, max_reproj_chi2, max_scale_ratio_factor,
+                           min_triangulated=50, homography_select_threshold=0.45):
+    """
+    Paper §IV automatic initialization: estimate a homography and a
+    fundamental matrix in parallel over the SAME matches (steps 1-2), score
+    both by symmetric transfer error (pose.homography_score/fundamental_
+    score, Eq. 2) and pick the better-conditioned one via the R_H heuristic
+    (step 3: R_H = S_H / (S_H + S_F), homography selected if R_H > 0.45 -
+    biases toward the more constrained homography model on a planar/low-
+    parallax scene, where a fundamental matrix is poorly conditioned), then
+    disambiguate the selected model's motion hypotheses by directly
+    triangulating each with triangulation.triangulate (step 4, octave-aware
+    since #33) rather than trusting cheirality alone - the paper notes
+    cheirality-only disambiguation is unreliable under low parallax. Each
+    hypothesis's score is its triangulated in-front/high-parallax/low-
+    reprojection-error point count.
+
+    Refuses to initialize (accepted=False in the returned dict) unless
+    there's a clear-winning hypothesis: the best hypothesis's point count
+    must reach both min_triangulated and 90% of the selected model's own
+    RANSAC-inlier correspondence count, AND no other hypothesis may come
+    within 70% of the best's count (mirrors ORB-SLAM2's own minTriangulated/
+    0.9*N/0.7*best acceptance test). This is what catches a homography's
+    genuine twofold planar ambiguity - e.g. the paper's own Table III
+    freiburg3_nostructure_texture_far reference case, see
+    EVALUATION_RESULTS.md - where two hypotheses triangulate comparably well
+    and neither can be trusted over the other. The caller should treat
+    accepted=False exactly like every other bootstrap-rejection path: keep
+    accumulating frames.
+
+    Returns None only if there's not enough data to attempt either model at
+    all (fewer than 8 matches, or both RANSAC fits fail) - the caller's
+    existing "bootstrap pose estimation failed" status covers this the same
+    as it did for the old essential-matrix-only path. Otherwise always
+    returns a dict (whether or not accepted) so the caller can report the
+    selected model and its R_H score every attempt, per this issue's
+    acceptance criteria:
+      accepted     - bool
+      model        - "H" or "F"
+      R_H          - float, the Eq. 3 score
+      n_hypotheses - how many motion hypotheses the selected model decomposed into
+      n_inliers    - the selected model's own RANSAC inlier count
+      best_n       - the winning (or, if rejected, best-but-not-dominant) hypothesis's triangulated point count
+    When accepted, additionally:
+      R_rel, t_rel                          - winning hypothesis's relative pose (camera1 -> camera2)
+      inlier_mask                            - boolean mask into matches/pts1/pts2 selecting the
+                                                selected model's RANSAC inliers (what was triangulated)
+      points_3d, valid, in_front, parallax_deg - triangulate()'s own outputs for the winning
+                                                hypothesis, over inlier_mask-selected pts1/pts2
+    """
+    from pipeline.pose import (
+        compose_pose, decompose_essential, decompose_homography,
+        estimate_fundamental_matrix, estimate_homography,
+        fundamental_score, homography_score,
+    )
+    from pipeline.triangulation import triangulate
+
+    if len(matches) < 8:
+        return None
+
+    h_result = estimate_homography(pts1, pts2)
+    f_result = estimate_fundamental_matrix(pts1, pts2)
+    if h_result is None and f_result is None:
+        return None
+
+    S_H = homography_score(h_result[0], pts1, pts2) if h_result is not None else 0.0
+    S_F = fundamental_score(f_result[0], pts1, pts2) if f_result is not None else 0.0
+    total = S_H + S_F
+    R_H = S_H / total if total > 0 else 0.0
+
+    if h_result is not None and (f_result is None or R_H > homography_select_threshold):
+        model = "H"
+        H, mask = h_result
+        hypotheses = decompose_homography(H, camera_matrix)
+    else:
+        model = "F"
+        F, mask = f_result
+        E = camera_matrix.T @ F @ camera_matrix
+        hypotheses = decompose_essential(E)
+
+    inlier_mask = mask.ravel().astype(bool)
+    n_inliers = int(inlier_mask.sum())
+    base = dict(model=model, R_H=R_H, n_hypotheses=len(hypotheses), n_inliers=n_inliers)
+    if n_inliers < min_pose_inliers or not hypotheses:
+        return dict(base, accepted=False, best_n=0)
+
+    in_pts1, in_pts2 = pts1[inlier_mask], pts2[inlier_mask]
+    match_list = [m for m, keep in zip(matches, inlier_mask) if keep]
+    octave1 = np.array([ref_kp[m.queryIdx].octave for m in match_list])
+    octave2 = np.array([kp[m.trainIdx].octave for m in match_list])
+
+    R_id, t_id = np.eye(3), np.zeros((3, 1))
+    scored = []
+    for R_h, t_h in hypotheses:
+        R_new, t_new = compose_pose(R_id, t_id, R_h, t_h)
+        points_3d, valid, in_front, parallax_deg = triangulate(
+            R_id, t_id, R_new, t_new, camera_matrix, in_pts1, in_pts2,
+            min_parallax_deg=min_triangulation_angle,
+            octave1=octave1, octave2=octave2,
+            pyramid_scale_factor=pyramid_scale_factor,
+            max_reproj_chi2=max_reproj_chi2,
+            max_scale_ratio_factor=max_scale_ratio_factor,
+        )
+        scored.append((int(valid.sum()), R_h, t_h, points_3d, valid, in_front, parallax_deg))
+    scored.sort(key=lambda s: s[0], reverse=True)
+
+    best_n = scored[0][0]
+    min_good = max(min_triangulated, int(0.9 * n_inliers))
+    n_dominant = sum(1 for s in scored if s[0] > 0.7 * best_n)
+    base["best_n"] = best_n
+
+    if best_n < min_good or n_dominant > 1:
+        return dict(base, accepted=False)
+
+    _, R_best, t_best, points_3d, valid, in_front, parallax_deg = scored[0]
+    return dict(
+        base, accepted=True, R_rel=R_best, t_rel=t_best,
+        inlier_mask=inlier_mask, points_3d=points_3d, valid=valid,
+        in_front=in_front, parallax_deg=parallax_deg,
+    )
+
+
 def _run_ba(keyframe_poses, keyframe_observations, sparse_map, camera_matrix,
             free_kfs, fixed_kfs, point_ids, max_points, max_nfev, ftol, xtol,
             outlier_chi2_threshold=5.991):
@@ -1510,11 +1634,10 @@ def _demo():
     from pipeline.depth_ml import DepthEstimator, colorize_depth_with_background, scanline_rows
     from pipeline.features import detect_and_compute_gridded, match_descriptors
     from pipeline.pose import (
-        estimate_relative_pose, rotation_angle_deg, compose_pose,
+        rotation_angle_deg, compose_pose,
         median_parallax, predict_constant_velocity, render_trajectory,
     )
     from pipeline.trajectory import write_tum_trajectory
-    from pipeline.triangulation import triangulate
 
     parser = argparse.ArgumentParser(
         description="Bootstrap a sparse map once, then track pose every frame via "
@@ -1534,7 +1657,7 @@ def _demo():
     parser.add_argument("--ratio", type=float, default=0.75, help="Lowe's ratio test threshold")
     parser.add_argument("--min-parallax", type=float, default=10.0,
                          help="Minimum median pixel displacement vs the reference frame "
-                              "before bootstrap accepts a two-view essential-matrix pose - "
+                              "before bootstrap attempts a two-view dual-model pose (paper IV) - "
                               "avoids the degenerate/ill-conditioned solve pure-rotation "
                               "motion produces. Does not gate TRACK-branch keyframe "
                               "promotion (that's --kf-* below, the paper's own §V-E policy - "
@@ -1577,7 +1700,10 @@ def _demo():
                               "keyframe count alone (see Map.local_map_keyframes) isn't "
                               "enough to keep this per-frame search cost bounded")
     parser.add_argument("--min-inliers", type=int, default=60,
-                         help="Minimum bootstrap (essential matrix) pose inliers to accept a keyframe")
+                         help="Minimum bootstrap RANSAC inliers (of whichever model - homography "
+                              "or fundamental matrix - the paper's IV dual-model selection picks, "
+                              "see mapping._bootstrap_dual_model) to even attempt motion-hypothesis "
+                              "disambiguation for a keyframe")
     parser.add_argument("--pnp-min-inliers", type=int, default=20,
                          help="Minimum PnP inliers required to accept a tracked frame's pose "
                               "(checked every frame, not just when it becomes a keyframe)")
@@ -1657,13 +1783,18 @@ def _demo():
                               "own search-radius widening)")
     parser.add_argument("--ba-every", type=int, default=1,
                          help="Only run local bundle adjustment every Nth accepted keyframe "
-                              "(default: every keyframe)")
+                              "(default: every keyframe) - applies to the TRACK branch's "
+                              "ongoing per-keyframe local BA only, NOT the bootstrap full-BA "
+                              "step (paper IV step 5), which always runs once, unconditionally, "
+                              "right after a successful bootstrap regardless of this value")
     parser.add_argument("--ba-max-points", type=int, default=300,
                          help="Cap on how many of the local BA scope's points (§VI-D: the "
                               "current keyframe + its covisibility-graph neighbors) a single "
                               "BA call refines (keeps the most recently added ones if exceeded)")
     parser.add_argument("--no-ba", action="store_true",
-                         help="Disable local bundle adjustment (for comparison)")
+                         help="Disable bundle adjustment (for comparison) - both the TRACK "
+                              "branch's ongoing local BA AND the bootstrap full-BA step "
+                              "(paper IV step 5)")
     parser.add_argument("--ba-outlier-chi2", type=float, default=5.991,
                          help="Paper §VI-D: 'observations that are marked as outliers are "
                               "discarded at the middle and at the end of the optimization'. "
@@ -1699,32 +1830,37 @@ def _demo():
                               "--trajectory-output/--plot-output. Expensive relative to local "
                               "BA - a one-shot end-of-run pass, not per-keyframe")
     parser.add_argument("--global-ba-max-nfev", type=int, default=8000,
-                         help="Solver iteration budget for --global-ba-at-end - a full map "
-                              "needs far more than local BA's default (1000) to converge")
+                         help="Solver iteration budget for --global-ba-at-end, and (unconditionally, "
+                              "not gated by that flag) for the paper's own one-shot full-BA "
+                              "bootstrap step (IV step 5, see mapping._bootstrap_dual_model's "
+                              "caller) - both need far more than local BA's default (1000) to converge")
     parser.add_argument("--global-ba-ftol", type=float, default=1e-6,
                          help="Solver relative cost-change convergence tolerance for "
-                              "--global-ba-at-end, tighter than local BA's default (1e-4) - "
+                              "--global-ba-at-end and the bootstrap full-BA step (see "
+                              "--global-ba-max-nfev), tighter than local BA's default (1e-4) - "
                               "local BA already runs continuously during tracking, so a "
-                              "loose tolerance lets a one-shot global pass falsely report "
+                              "loose tolerance lets a one-shot full/global pass falsely report "
                               "convergence after only a few iterations without reaching a "
-                              "true joint optimum over the whole trajectory")
+                              "true joint optimum over its scope")
     parser.add_argument("--global-ba-xtol", type=float, default=1e-6,
                          help="Solver relative parameter-change convergence tolerance for "
-                              "--global-ba-at-end - see --global-ba-ftol")
+                              "--global-ba-at-end and the bootstrap full-BA step - see "
+                              "--global-ba-ftol")
     parser.add_argument("--global-ba-max-plausible-rotation", type=float, default=90.0,
                          help="Per-keyframe rotation-change plausibility bound for "
-                              "--global-ba-at-end's result, looser than --max-plausible-rotation "
+                              "--global-ba-at-end's result and the bootstrap full-BA step's result "
+                              "(see --global-ba-max-nfev), looser than --max-plausible-rotation "
                               "(15deg default, tuned for local BA/PnP) - a full-trajectory drift "
                               "correction can legitimately move an old keyframe's rotation more "
                               "than a per-frame sanity check allows; this still catches a wild "
                               "PnP-ambiguity-style flip")
     parser.add_argument("--global-ba-max-step-ratio", type=float, default=200.0,
                          help="Per-keyframe step-change plausibility bound for "
-                              "--global-ba-at-end's result (as a multiple of recent per-frame "
-                              "tracking step size), looser than --max-step-ratio (6.0 default, "
-                              "tuned for local BA/PnP) for the same reason as "
-                              "--global-ba-max-plausible-rotation - a full-trajectory correction "
-                              "isn't bounded by one frame's worth of motion")
+                              "--global-ba-at-end's result and the bootstrap full-BA step's result "
+                              "(as a multiple of recent per-frame tracking step size), looser than "
+                              "--max-step-ratio (6.0 default, tuned for local BA/PnP) for the same "
+                              "reason as --global-ba-max-plausible-rotation - a full-trajectory "
+                              "correction isn't bounded by one frame's worth of motion")
     parser.add_argument("--plot-output", default="results/map_trajectory.png")
     parser.add_argument("--trajectory-output",
                          help="Write each accepted keyframe's pose to this path in TUM format "
@@ -1895,129 +2031,154 @@ def _demo():
                 parallax = median_parallax(pts1, pts2)
 
             if len(sparse_map) == 0:
-                # --- Bootstrap: two-view pose + triangulation, once - still
-                # gated on accumulated parallax vs. the reference frame, since
-                # (unlike guided per-frame tracking below) a two-view
-                # essential-matrix solve has no map yet to be guided by and
-                # needs a real baseline to be well-conditioned at all ---
+                # --- Bootstrap: two-view dual-model (homography/fundamental
+                # matrix) pose + triangulation, once (paper §IV, see
+                # _bootstrap_dual_model) - still gated on accumulated
+                # parallax vs. the reference frame, since (unlike guided
+                # per-frame tracking below) a two-view solve has no map yet
+                # to be guided by and needs a real baseline to be well-
+                # conditioned at all ---
                 if has_ref_baseline and parallax < args.min_parallax:
                     status = "accumulating parallax"
                 elif has_ref_baseline:
-                    result = estimate_relative_pose(ref_kp, kp, matches_ref, K)
+                    result = _bootstrap_dual_model(
+                        ref_kp, kp, matches_ref, pts1, pts2, K,
+                        min_pose_inliers=args.min_inliers,
+                        min_triangulation_angle=args.min_triangulation_angle,
+                        pyramid_scale_factor=sparse_map.pyramid_scale_factor,
+                        max_reproj_chi2=args.triangulation_max_reproj_chi2,
+                        max_scale_ratio_factor=args.triangulation_scale_ratio_factor,
+                    )
                     if result is None:
                         status = "bootstrap pose estimation failed"
+                    elif not result["accepted"]:
+                        status = (
+                            f"bootstrap: no dominant motion hypothesis (model={result['model']} "
+                            f"R_H={result['R_H']:.2f}, best {result['best_n']}/{result['n_inliers']} "
+                            f"triangulated of {result['n_hypotheses']} hypotheses)"
+                        )
+                        # Printed unconditionally (like every OTHER bootstrap/
+                        # keyframe outcome below - status is otherwise only
+                        # shown in the --no-display-gated live overlay): the
+                        # R_H trend across a sequence's early refused attempts
+                        # is itself paper-relevant evidence (§IV, e.g. this
+                        # issue's freiburg3_nostructure_texture_far reference
+                        # case), not just the eventual accepted one.
+                        print(f"frame {frame.index}: {status}")
                     else:
-                        R_rel, t_rel, mask_pose, _, _ = result
-                        inliers = int(mask_pose.sum())
-                        if inliers < args.min_inliers:
-                            status = f"bootstrap: too few inliers ({inliers})"
-                        else:
-                            R_new, t_new = compose_pose(R_pos, t_pos, R_rel, t_rel)
-                            inlier_mask = mask_pose.ravel().astype(bool)
+                        R_rel, t_rel = result["R_rel"], result["t_rel"]
+                        inliers = result["n_inliers"]
+                        R_new, t_new = compose_pose(R_pos, t_pos, R_rel, t_rel)
+                        inlier_mask = result["inlier_mask"]
+                        new_points, valid = result["points_3d"], result["valid"]
 
-                            octave1 = np.array(
-                                [ref_kp[m.queryIdx].octave for m in matches_ref]
-                            )[inlier_mask]
-                            octave2 = np.array(
-                                [kp[m.trainIdx].octave for m in matches_ref]
-                            )[inlier_mask]
-                            new_points, valid, in_front, parallax_deg = triangulate(
-                                R_pos, t_pos, R_new, t_new, K,
-                                pts1[inlier_mask], pts2[inlier_mask],
-                                min_parallax_deg=args.min_triangulation_angle,
-                                octave1=octave1, octave2=octave2,
-                                pyramid_scale_factor=sparse_map.pyramid_scale_factor,
-                                max_reproj_chi2=args.triangulation_max_reproj_chi2,
-                                max_scale_ratio_factor=args.triangulation_scale_ratio_factor,
+                        kept_matches = [m for m, keep in zip(matches_ref, inlier_mask) if keep]
+                        kept_matches = [m for m, keep in zip(kept_matches, valid) if keep]
+                        new_desc = desc[[m.trainIdx for m in kept_matches]]
+
+                        new_kf_idx = len(keyframe_poses)  # kf 1 - about to be appended below
+                        base_idx = len(sparse_map)
+                        sparse_map.add_points(new_points[valid], new_desc, created_kf=new_kf_idx)
+                        new_ids = list(range(base_idx, base_idx + int(valid.sum())))
+                        obs_ref = pts1[inlier_mask][valid]
+                        obs_cur = pts2[inlier_mask][valid]
+                        keyframe_observations[0].extend(
+                            (pid, x, y) for pid, (x, y) in zip(new_ids, obs_ref)
+                        )
+                        keyframe_observations.append(
+                            [(pid, x, y) for pid, (x, y) in zip(new_ids, obs_cur)]
+                        )
+
+                        # §III-C/III-D bookkeeping: each new point's two
+                        # founding observations (kf 0 = ref, kf 1 = this
+                        # frame) - registered here (rather than folded
+                        # into keyframe_observations above) since it also
+                        # needs each observation's descriptor/pyramid
+                        # octave, not just its pixel position.
+                        ref_frame_idx = [m.queryIdx for m in kept_matches]
+                        cur_frame_idx = [m.trainIdx for m in kept_matches]
+                        ref_center = camera_center(R_pos, t_pos)
+                        cur_center = camera_center(R_new, t_new)
+                        for pid, fidx in zip(new_ids, ref_frame_idx):
+                            sparse_map.add_observation(
+                                pid, 0, ref_center, ref_desc[fidx], ref_kp[fidx].octave,
+                                frame_idx=fidx,
                             )
-                            kept_matches = [m for m, keep in zip(matches_ref, inlier_mask) if keep]
-                            kept_matches = [m for m, keep in zip(kept_matches, valid) if keep]
-                            new_desc = desc[[m.trainIdx for m in kept_matches]]
-
-                            new_kf_idx = len(keyframe_poses)  # kf 1 - about to be appended below
-                            base_idx = len(sparse_map)
-                            sparse_map.add_points(new_points[valid], new_desc, created_kf=new_kf_idx)
-                            new_ids = list(range(base_idx, base_idx + int(valid.sum())))
-                            obs_ref = pts1[inlier_mask][valid]
-                            obs_cur = pts2[inlier_mask][valid]
-                            keyframe_observations[0].extend(
-                                (pid, x, y) for pid, (x, y) in zip(new_ids, obs_ref)
-                            )
-                            keyframe_observations.append(
-                                [(pid, x, y) for pid, (x, y) in zip(new_ids, obs_cur)]
-                            )
-
-                            # §III-C/III-D bookkeeping: each new point's two
-                            # founding observations (kf 0 = ref, kf 1 = this
-                            # frame) - registered here (rather than folded
-                            # into keyframe_observations above) since it also
-                            # needs each observation's descriptor/pyramid
-                            # octave, not just its pixel position.
-                            ref_frame_idx = [m.queryIdx for m in kept_matches]
-                            cur_frame_idx = [m.trainIdx for m in kept_matches]
-                            ref_center = camera_center(R_pos, t_pos)
-                            cur_center = camera_center(R_new, t_new)
-                            for pid, fidx in zip(new_ids, ref_frame_idx):
-                                sparse_map.add_observation(
-                                    pid, 0, ref_center, ref_desc[fidx], ref_kp[fidx].octave,
-                                    frame_idx=fidx,
-                                )
-                            for pid, fidx in zip(new_ids, cur_frame_idx):
-                                sparse_map.add_observation(
-                                    pid, new_kf_idx, cur_center, desc[fidx], kp[fidx].octave,
-                                    frame_idx=fidx,
-                                )
-
-                            print(f"frame {frame.index}: BOOTSTRAP  parallax={parallax:.1f}px  "
-                                  f"{inliers} pose inliers, {int(valid.sum())} points seeded")
-
-                            recent_step_sizes.append(
-                                np.linalg.norm(camera_center(R_new, t_new) - camera_center(R_pos, t_pos))
+                        for pid, fidx in zip(new_ids, cur_frame_idx):
+                            sparse_map.add_observation(
+                                pid, new_kf_idx, cur_center, desc[fidx], kp[fidx].octave,
+                                frame_idx=fidx,
                             )
 
-                            prev_pose = (R_pos, t_pos)
-                            prev_pose_frame = cur_pose_frame
-                            R_pos, t_pos = R_new, t_new
-                            cur_pose_frame = frame.index
-                            keyframe_poses.append(KeyframePose(R_pos, t_pos, frame.timestamp))
-                            keyframe_kp.append(kp)
-                            keyframe_desc.append(desc)
-                            culled_trial = sparse_map.cull_new_points(new_kf_idx)
-                            culled_ongoing = sparse_map.cull_low_observation_points(new_kf_idx)
-                            total_culled_trial += len(culled_trial)
-                            total_culled_ongoing += len(culled_ongoing)
-                            if not args.no_ba and len(keyframe_poses) % args.ba_every == 0:
-                                ba_result = _run_local_ba(
-                                    keyframe_poses, keyframe_observations, sparse_map, K,
-                                    max_points=args.ba_max_points,
-                                    outlier_chi2_threshold=args.ba_outlier_chi2,
-                                )
-                                R_pos, t_pos, n_ba_outliers, n_ba_culled = _validate_and_apply_ba(
-                                    ba_result, keyframe_poses, keyframe_observations, sparse_map,
-                                    recent_step_sizes, R_pos, t_pos,
-                                    args.max_plausible_rotation, args.max_step_ratio,
-                                    new_kf_idx,
-                                )
-                                total_ba_outliers_discarded += n_ba_outliers
-                                total_culled_from_ba_outliers += n_ba_culled
-                            if not args.no_keyframe_cull:
-                                culled_kfs, culled_pts_kf = _cull_redundant_keyframes(
-                                    sparse_map, keyframe_observations, new_kf_idx,
-                                    max_candidates=args.keyframe_cull_max_candidates,
-                                    min_observers=args.keyframe_cull_min_observers,
-                                    redundancy_ratio=args.keyframe_cull_ratio,
-                                )
-                                total_keyframes_culled += len(culled_kfs)
-                                total_culled_from_keyframe_cull += len(culled_pts_kf)
-                            n_keyframes += 1
-                            is_keyframe = True
-                            status = f"BOOTSTRAP ({int(valid.sum())} points seeded)"
+                        print(f"frame {frame.index}: BOOTSTRAP  model={result['model']} "
+                              f"R_H={result['R_H']:.2f}  parallax={parallax:.1f}px  "
+                              f"{inliers} pose inliers, {int(valid.sum())} points seeded")
+
+                        recent_step_sizes.append(
+                            np.linalg.norm(camera_center(R_new, t_new) - camera_center(R_pos, t_pos))
+                        )
+
+                        prev_pose = (R_pos, t_pos)
+                        prev_pose_frame = cur_pose_frame
+                        R_pos, t_pos = R_new, t_new
+                        cur_pose_frame = frame.index
+                        keyframe_poses.append(KeyframePose(R_pos, t_pos, frame.timestamp))
+                        keyframe_kp.append(kp)
+                        keyframe_desc.append(desc)
+                        culled_trial = sparse_map.cull_new_points(new_kf_idx)
+                        culled_ongoing = sparse_map.cull_low_observation_points(new_kf_idx)
+                        total_culled_trial += len(culled_trial)
+                        total_culled_ongoing += len(culled_ongoing)
+                        if not args.no_ba:
+                            # Paper §IV step 5: a one-shot FULL BA over the
+                            # accepted two-view reconstruction, before it's
+                            # used as this map's founding keyframe pair -
+                            # not the ongoing per-keyframe local BA the TRACK
+                            # branch below runs (there are only 2 keyframes
+                            # right now anyway, so "full" and "local" are the
+                            # same scope here; what differs is the paper
+                            # wants this one done thoroughly, hence the
+                            # looser/higher-iteration --global-ba-* tuning
+                            # rather than local BA's lighter continuous-
+                            # tracking defaults - and unconditionally, not
+                            # subject to --ba-every's throttling, which only
+                            # exists to bound RECURRING per-keyframe cost).
+                            t0_ba = time.perf_counter()
+                            ba_result = _run_global_ba(
+                                keyframe_poses, keyframe_observations, sparse_map, K,
+                                max_nfev=args.global_ba_max_nfev,
+                                ftol=args.global_ba_ftol, xtol=args.global_ba_xtol,
+                                outlier_chi2_threshold=args.ba_outlier_chi2,
+                            )
+                            R_pos, t_pos, n_ba_outliers, n_ba_culled = _validate_and_apply_ba(
+                                ba_result, keyframe_poses, keyframe_observations, sparse_map,
+                                recent_step_sizes, R_pos, t_pos,
+                                args.global_ba_max_plausible_rotation, args.global_ba_max_step_ratio,
+                                new_kf_idx,
+                            )
+                            total_ba_outliers_discarded += n_ba_outliers
+                            total_culled_from_ba_outliers += n_ba_culled
+                            print(f"    [bootstrap full BA (paper IV step 5): "
+                                  f"{time.perf_counter() - t0_ba:.2f}s]")
+                        if not args.no_keyframe_cull:
+                            culled_kfs, culled_pts_kf = _cull_redundant_keyframes(
+                                sparse_map, keyframe_observations, new_kf_idx,
+                                max_candidates=args.keyframe_cull_max_candidates,
+                                min_observers=args.keyframe_cull_min_observers,
+                                redundancy_ratio=args.keyframe_cull_ratio,
+                            )
+                            total_keyframes_culled += len(culled_kfs)
+                            total_culled_from_keyframe_cull += len(culled_pts_kf)
+                        n_keyframes += 1
+                        is_keyframe = True
+                        status = (f"BOOTSTRAP ({int(valid.sum())} points seeded, "
+                                  f"model={result['model']})")
 
             else:
                 # --- Track: motion-predicted guided PnP against the map,
                 # attempted every frame against every active (not yet §VI-B-
                 # culled) point. --min-parallax plays no role here at all -
-                # it only gates bootstrap's essential-matrix estimation above;
+                # it only gates bootstrap's dual-model estimation above;
                 # whether this frame's tracked pose *also* gets promoted to a
                 # keyframe is decided purely by the §V-E policy below. ---
                 track_accepted = False
