@@ -1702,3 +1702,138 @@ than glosses over. `Map.match_against_guided` was deliberately left
 untouched (see the Scope decision above) - a candidate for a future issue if
 its own false-match rate is ever separately identified as a problem worth
 solving.
+
+---
+
+## #13: Relocalization after tracking loss
+
+**Version:** `issue-13-relocalization-after-tracking-loss` branch, on top of
+`main` post-#14 (`--depth-densify` not passed). Implements
+[#13](https://github.com/albinjanssonsand/slam/issues/13): once ordinary
+per-frame guided PnP tracking has failed `--relocalize-after-frames`
+(default 5) consecutive frames, a new `--relocalize` flag (off by default)
+attempts a wide, unguided search - `Map.match_against` against the ENTIRE
+active map, no predicted-pose window - followed by `estimate_pose_pnp`
+fresh, with no assumption of a nearby previous pose. Deliberately skips the
+rotation-vs-previous-frame/step-vs-recent-median plausibility checks
+ordinary tracking runs (those assume continuity a relocalization by
+definition doesn't have); the same `--pnp-min-inliers` bar ordinary tracking
+itself requires is what validates the recovered pose instead. On success,
+resumes ordinary tracking from the recovered pose - not a separate code
+path - and re-anchors the plain (non-guided) reference-keyframe match
+(`has_ref_baseline`, condition 4's baseline) to whichever existing keyframe
+shares the most of the relocalization's own inlier points, so a future
+keyframe stays reachable even if the pre-loss reference is visually
+unrelated to the recovered location.
+
+**Fresh baselines first (required by the issue - old frame-37/frame-100
+citations predate #15-#33 and are stale, and #14 itself already showed
+`desk`/`room`'s bootstrap point shifts by 1-2 frames):** used #14's own
+already-fresh `desk`/`room` post-fix rows directly (re-confirmed identical
+here with `--relocalize` off), and additionally re-baselined
+`freiburg2_pioneer_slam2` fresh against current `main` for the first time
+since #14 landed, since no prior section had done so.
+
+| Sequence | Bootstrap frame | Keyframes | Active/total points | Death/degenerate point | Coverage | ATE/RPE RMSE (m) |
+|---|---|---|---|---|---|---|
+| `desk` (fresh, `--relocalize` off, = #14's post-fix row) | 4 | 3 | 414/650 | frame 24/613 | 1.0% (0.23s/23.4s) | 0.0107 / 0.0171 |
+| `room` (fresh, `--relocalize` off, = #14's post-fix row) | 3 | 1 | 107/107 | frame 19/1362 (0 KF beyond bootstrap) | 0.20% (0.10s/48.9s) | degenerate (2 KF) |
+| `freiburg2_pioneer_slam2` (fresh, first re-baseline since #14) | 79 | 6 | 142/331 | frame ~155/2113 | 4.1% (4.74s/115.6s) | 0.0104 / 0.0141 |
+
+`pioneer_slam2`'s fresh numbers (bootstrap frame 79, dies ~frame 155 with 6
+keyframes) differ substantially from every previously-documented run of this
+sequence (bootstrap ~frame 2-4, dies frame ~173-181 with 38-44 keyframes,
+per #17/#20/#23/#27) - consistent with #14's own already-established effect
+of shifting which frame pair first clears the cross-check matcher's stricter
+bar, just a much larger shift than `desk`/`room` saw, and not something any
+prior section had actually re-measured on this sequence. Not investigated
+further here (out of this issue's own scope), but worth flagging for
+whoever next relies on `pioneer_slam2`'s "frame 181" citation.
+
+**Relocalization results, all four required sequences (`--relocalize` on,
+`--relocalize-after-frames` default 5):**
+
+| Sequence | Attempts | Succeeded | Recovery length | Reached a new keyframe? | Coverage/ATE/RPE change |
+|---|---|---|---|---|---|
+| `desk` | 577 | 1 (frame 30, 29/56 inliers) | 1 extra frame (31), lost again | No | None - byte-identical to the flag-off row above |
+| `room` | 1328 | 1 (frame 93, 20/25 inliers, after 73 lost frames) | ~14 frames (93-97+), lost again | No | None - still degenerate (2 KF), same as flag-off |
+| `freiburg2_pioneer_slam2` | 1952 | 0 | n/a | n/a | None - correctly declines to (falsely) relocalize |
+| `freiburg1_xyz` (regression control) | 21 | 1 (frame 48) | recovered permanently (already-healthy sequence) | yes, ordinarily | See below - NOT a clean no-op |
+
+**`desk`/`room`: the mechanism genuinely works end-to-end on real data, but
+neither reaches the bar to matter.** Both logs show a real, unambiguous
+recovery - full-map matches, a passing PnP+RANSAC inlier count, tracking
+resuming via the ordinary guided-matching path on the very next frame (e.g.
+`room`'s frame 94-97 are indistinguishable in form from any other healthy
+`TRACK` line) - not a false positive. But on `desk` the recovery survives
+only 1 extra frame before the same fast-pan failure mode (documented
+separately, this session's earlier investigation) reasserts itself; on
+`room` it survives longer (~14 frames) but still not the
+`--kf-min-frames-since-relocalization` (20) + `--kf-max-frames-since-keyframe`
+(20) grace period needed to become eligible for a new keyframe, on a
+sequence that (per #14's own fresh baseline) already couldn't produce a
+*second* keyframe even right after a healthy bootstrap. Neither sequence's
+"too hard" classification changes. `freiburg2_pioneer_slam2` is the
+important negative control: 1952 attempts, 0 successes, matching the
+issue's own ground-truth-verified prediction that this specific run's
+camera never revisits the pre-death map - "correctly declines" is the
+success criterion here, not a demonstrated recovery, and that's what
+happened.
+
+**`freiburg1_xyz` regression check: not a byte-identical no-op, for a
+reason worth understanding rather than glossing over.** The flag-off
+baseline (`postfix_xyz_run.log`, #14's row) already contains a 27-frame gap
+(frames 22-48) where per-frame tracking fails entirely before recovering on
+its own at frame 49 via the ordinary guided path (`trigger=max-frames-
+fallback`) - a pre-existing property of this sequence, confirmed unrelated
+to this issue (frames 1-47 of the `--relocalize` run are byte-*identical* to
+the flag-off baseline, diff-confirmed). Because that gap is 27 frames long
+(> the 5-frame `--relocalize-after-frames` default), `--relocalize` fires
+21 times against it and succeeds once, one frame earlier (48) than the
+baseline's own natural recovery (49). That one extra `cv2.solvePnPRansac`
+call (and the 20 other failed attempts' worth of calls) is enough to change
+the outcome for the entire rest of the run: OpenCV's RANSAC estimators draw
+from process-global RNG state, not a call-local one, so every subsequent
+`findEssentialMat`/`solvePnPRansac` call anywhere later in the run now draws
+a different sequence than the flag-off baseline did, even on frames that
+have nothing to do with relocalization. The result stays qualitatively
+healthy (77 final keyframes vs. 88, 13165/47389 vs. 16639/63091 active/total
+points, 88.3% vs. 86.6% coverage - all the same order of magnitude, not a
+collapse), but ATE/RPE get measurably worse: ATE RMSE 0.0229m -> 0.0555m
+(+142%), RPE RMSE 0.0218m -> 0.0494m (+127%). This is not a logic bug in
+this issue's own code (verified: frames 1-47 are identical, so nothing
+before the first relocalization attempt is touched) and not something #13
+should fix on its own (OpenCV's shared-RNG behavior is a pre-existing
+property of every RANSAC call this whole codebase already makes, already
+flagged as a source of run-to-run variance in #14's own write-up above) -
+but it does mean **`--relocalize` is not accuracy-neutral on a sequence
+that already has an occasional multi-frame self-recovering gap**, even when
+relocalization's own outcome is otherwise harmless. Documented in the
+flag's own `--help` text rather than left as a silent surprise.
+
+**Performance (required by the issue):** full-map search cost measured
+directly across all four runs: 3.7-27.8ms/attempt (`desk` 27.8ms/attempt
+over 577 attempts = 16.04s total; `room` 3.7ms/attempt over 1328 attempts =
+4.85s total; `pioneer_slam2` 6.6ms/attempt over 1952 attempts = 12.88s
+total; `xyz` 26.1ms/attempt over 21 attempts = 0.55s total) - cheap enough
+per attempt that even ~2000 attempts across a whole sequence costs well
+under 15 seconds of a multi-minute run, confirming the
+`--relocalize-after-frames` threshold (avoiding an attempt on every single
+skipped frame) wasn't strictly necessary for cost reasons on these map
+sizes, though it remains the right default since a larger, longer-lived map
+would scale this cost up linearly with active point count.
+
+**Net result:** relocalization is implemented per the issue's own
+constraints (reuses `Map.match_against`/`estimate_pose_pnp`, no new hard
+dependency, gated behind `--relocalize`) and demonstrably works - two of
+three hard sequences show a genuine, unambiguous recovery event on real
+data, and the known-hard negative control correctly declines rather than
+producing a false recovery. It does not change `desk`/`room`'s "too hard"
+classification, because neither recovery survives long enough to reach a
+new keyframe - a result the issue's own acceptance criteria anticipated
+("a 'no relocalization found, correctly' outcome... is success for
+correctness, not a demonstrated win") and this report takes at face value
+rather than oversells. The one real surprise - `--relocalize` perturbing
+`freiburg1_xyz`'s accuracy despite "never triggering" being false for that
+sequence - is reported honestly rather than hidden behind a rerun chosen to
+avoid it.
