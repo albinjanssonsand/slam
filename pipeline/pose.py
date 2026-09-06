@@ -41,6 +41,161 @@ def estimate_relative_pose(kp1, kp2, matches, camera_matrix):
     return R, t, mask_pose, pts1, pts2
 
 
+def estimate_homography(pts1, pts2, ransac_threshold=3.0, max_iters=2000, confidence=0.999):
+    """
+    Estimate a planar homography (x2 ~ H x1, pixel coordinates) via RANSAC -
+    the paper's parallel model to estimate_fundamental_matrix (§IV steps
+    1-2, mapping._bootstrap_dual_model), scored against it via
+    homography_score before one of the two is picked.
+
+    Returns (H, mask) - mask is an inlier mask (Nx1), matching
+    estimate_relative_pose's convention - or None if there aren't enough
+    matches or the RANSAC fit fails.
+    """
+    if len(pts1) < 4:
+        return None
+    H, mask = cv2.findHomography(
+        pts1, pts2, method=cv2.RANSAC, ransacReprojThreshold=ransac_threshold,
+        maxIters=max_iters, confidence=confidence,
+    )
+    if H is None:
+        return None
+    return H, mask
+
+
+def estimate_fundamental_matrix(pts1, pts2, ransac_threshold=3.0, max_iters=2000, confidence=0.999):
+    """
+    Estimate the (uncalibrated) fundamental matrix via RANSAC - the paper's
+    parallel model to estimate_homography (§IV steps 1-2). Deliberately not
+    calibrated to an essential matrix here: the R_H model-selection score
+    (fundamental_score) operates directly on pixel coordinates, and E is
+    only needed at all once this model has actually been selected (see
+    decompose_essential, given camera_matrix.T @ F @ camera_matrix).
+
+    Returns (F, mask) or None if there aren't enough matches or the RANSAC
+    fit fails.
+    """
+    if len(pts1) < 8:
+        return None
+    F, mask = cv2.findFundamentalMat(
+        pts1, pts2, method=cv2.FM_RANSAC, ransacReprojThreshold=ransac_threshold,
+        confidence=confidence, maxIters=max_iters,
+    )
+    if F is None or F.shape != (3, 3):
+        return None
+    return F, mask
+
+
+def decompose_homography(H, camera_matrix):
+    """
+    Recover motion hypotheses from a homography (paper §IV step 4's
+    homography branch, up to 8 solutions before OpenCV's own built-in
+    positive-depth filtering - see cv2.decomposeHomographyMat) rather than
+    committing to a single one - mapping._bootstrap_dual_model disambiguates
+    them itself by directly triangulating each.
+
+    Returns a list of (R, t) - t is a direction only (unit-length up to the
+    homography's own unknown-depth normalization), like decompose_essential.
+    """
+    _, rotations, translations, _ = cv2.decomposeHomographyMat(H, camera_matrix)
+    return [(R, t.reshape(3, 1)) for R, t in zip(rotations, translations)]
+
+
+def decompose_essential(E):
+    """
+    Recover all 4 motion hypotheses [R1,t], [R1,-t], [R2,t], [R2,-t] from an
+    essential matrix via SVD (paper §IV step 4's fundamental-matrix branch).
+
+    Unlike estimate_relative_pose's cv2.recoverPose (which already commits
+    to a single hypothesis via its own internal cheirality vote), this
+    exposes every candidate so mapping._bootstrap_dual_model can disambiguate
+    them itself by directly triangulating each, per the paper - cheirality
+    alone is unreliable under low parallax.
+    """
+    R1, R2, t = cv2.decomposeEssentialMat(E)
+    t = t.reshape(3, 1)
+    return [(R1, t), (R1, -t), (R2, t), (R2, -t)]
+
+
+def _symmetric_transfer_score(err1_sq, err2_sq, threshold, gamma):
+    """
+    Paper §IV Eq. 2: sum, over every correspondence, of (gamma - d1^2) +
+    (gamma - d2^2), each term included only where that OWN direction's
+    squared transfer error falls under threshold (0 otherwise) - matching
+    ORB-SLAM2's actual CheckHomography/CheckFundamental (each direction is
+    its own independent inlier test and reward, not a combined two-way
+    error checked against one threshold): a correspondence that fits
+    perfectly in one direction but poorly in the other still banks the
+    first direction's reward, and a correspondence whose two individual
+    errors are each just under threshold isn't wrongly zeroed out by their
+    SUM exceeding it. Rewards inliers in proportion to how well they fit
+    rather than a flat inlier count, so the two models' scores stay
+    comparable regardless of how many of their own RANSAC iterations'
+    correspondences happen to qualify.
+    """
+    s1 = np.where(err1_sq < threshold, gamma - err1_sq, 0.0)
+    s2 = np.where(err2_sq < threshold, gamma - err2_sq, 0.0)
+    return float(s1.sum() + s2.sum())
+
+
+def homography_score(H, pts1, pts2, threshold=5.99, gamma=5.99):
+    """
+    Paper §IV Eq. 2 score for a homography model: symmetric transfer error
+    is the squared reprojection distance, scored independently in each
+    direction (x2 vs H x1, x1 vs H^-1 x2 - see _symmetric_transfer_score).
+    threshold/gamma default to T_H=5.99 (paper's own 2-DOF, 95%-confidence
+    chi-squared bound).
+
+    Returns 0.0 (the model simply doesn't score, rather than raising) if H
+    is numerically singular - a real possibility straight out of RANSAC (a
+    near-planar/low-parallax correspondence set, exactly the kind of scene
+    this dual-model selection exists to handle, can produce a degenerate
+    fit) that would otherwise crash mapping._bootstrap_dual_model's caller
+    instead of letting it fall through to "no dominant motion hypothesis"/
+    keep accumulating frames like every other bootstrap-rejection path.
+    """
+    try:
+        H_inv = np.linalg.inv(H)
+    except np.linalg.LinAlgError:
+        return 0.0
+
+    p1h = np.hstack([pts1, np.ones((len(pts1), 1))])
+    p2h = np.hstack([pts2, np.ones((len(pts2), 1))])
+    proj2 = (H @ p1h.T).T
+    proj2 = proj2[:, :2] / proj2[:, 2:3]
+    proj1 = (H_inv @ p2h.T).T
+    proj1 = proj1[:, :2] / proj1[:, 2:3]
+    err2_sq = np.sum((proj2 - pts2) ** 2, axis=1)
+    err1_sq = np.sum((proj1 - pts1) ** 2, axis=1)
+
+    return _symmetric_transfer_score(err1_sq, err2_sq, threshold, gamma)
+
+
+def fundamental_score(F, pts1, pts2, threshold=3.84, gamma=5.99):
+    """
+    Paper §IV Eq. 2 score for a fundamental-matrix model: symmetric transfer
+    error is the squared point-to-epipolar-line distance, scored
+    independently in each direction (see _symmetric_transfer_score).
+    threshold defaults to T_F=3.84 (paper's own 1-DOF, 95%-confidence
+    chi-squared bound - a point-to-line distance has one degree of freedom,
+    unlike a point-to-point reprojection's two); gamma stays T_H=5.99 (same
+    as homography_score's default) so both models' rewards are on the same
+    scale, per the paper - the whole point of R_H being able to compare them.
+    """
+    p1h = np.hstack([pts1, np.ones((len(pts1), 1))])
+    p2h = np.hstack([pts2, np.ones((len(pts2), 1))])
+    lines2 = (F @ p1h.T).T
+    lines1 = (F.T @ p2h.T).T
+    num2 = np.sum(lines2[:, :2] * p2h[:, :2], axis=1) + lines2[:, 2]
+    num1 = np.sum(lines1[:, :2] * p1h[:, :2], axis=1) + lines1[:, 2]
+    denom2 = np.maximum(np.sum(lines2[:, :2] ** 2, axis=1), 1e-12)
+    denom1 = np.maximum(np.sum(lines1[:, :2] ** 2, axis=1), 1e-12)
+    err2_sq = (num2 ** 2) / denom2
+    err1_sq = (num1 ** 2) / denom1
+
+    return _symmetric_transfer_score(err1_sq, err2_sq, threshold, gamma)
+
+
 def rotation_angle_deg(R):
     """Magnitude of the rotation represented by R, in degrees."""
     rvec, _ = cv2.Rodrigues(R)
