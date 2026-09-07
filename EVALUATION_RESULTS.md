@@ -2355,3 +2355,102 @@ python -m pipeline.mapping --video datasets/tum/rgbd_dataset_freiburg1_<seq> --c
 evo_ape tum datasets/tum/rgbd_dataset_freiburg1_<seq>/groundtruth.txt results/issue47_<seq>_baseline_estimate.txt -a -s
 evo_rpe tum datasets/tum/rgbd_dataset_freiburg1_<seq>/groundtruth.txt results/issue47_<seq>_baseline_estimate.txt -a -s
 ```
+
+---
+
+## #47 (part 2): eight tested mechanisms, all negative, for `freiburg1_desk`'s whip-pan; `xyz`'s `--global-ba-at-end` measured
+
+**Version:** `issue-47-xyz-desk-investigation` branch, `main` @ `85f1bb3`
+(part 1) unchanged - no pipeline code touched, all runs use the corrected
+`slam` conda environment.
+
+### `freiburg1_xyz`: `--global-ba-at-end` (per user direction, not pursued
+further - `xyz` accuracy is secondary to `desk`'s tracking loss for this
+phase)
+
+One-shot full BA over the whole trajectory (85 keyframes, 13511 active
+points) after part 1's re-baseline:
+
+| Config | ATE RMSE (m) | RPE RMSE (m) | Wall-clock cost |
+|---|---|---|---|
+| Baseline (part 1) | 0.0702 | 0.0898 | - |
+| `--global-ba-at-end` | 0.0675 (-4%) | 0.0873 (-3%) | 1426s (~24 min) for the BA pass alone |
+
+Reprojection error did genuinely improve (mean 2.40px -> 1.29px, so the
+solve itself worked, wasn't rejected as implausible), but the ATE/RPE
+change is marginal - not worth its cost as a fix direction. Also a useful
+correction to `_run_global_ba`'s own docstring assumption
+(`mapping.py:1150`) that a one-shot full-map pass is "acceptable... only
+runs during the brief initialization phase" - true for bootstrap's own
+small-map call, not for `--global-ba-at-end`'s full-trajectory one, which
+was apparently never wall-clock-tested before at this map size.
+
+### `freiburg1_desk`: comprehensive re-verification under the corrected
+environment - every tested mechanism, including the prior session's key
+ones, still fails
+
+Part 1 already showed `desk`'s honest baseline is worse than previously
+documented (death frame 40, not 45). Before accepting "not fixable" as
+this phase's conclusion, every mechanism the issue's own candidate list
+names was tested (or re-tested) directly against the corrected baseline -
+several of the prior investigation's negative results had only ever been
+measured under the wrong OpenCV environment (pitfall #4) and needed
+re-verification, not just an assumption that they'd hold.
+
+| # | Mechanism | Death/gap | Keyframes | Coverage | ATE/RPE RMSE (m) | Verdict |
+|---|---|---|---|---|---|---|
+| 1 | Baseline (part 1) | frame 40, clean | 4 | 3.1% | 0.0194 / 0.0430 | reference |
+| 2 | `--rotation-only-fallback` | frame 40, clean (byte-identical) | 4 | 3.1% | 0.0194 / 0.0430 | **no-op** - fires once, correctly declines (real translation present, R_H heuristic doesn't favor pure rotation) |
+| 3 | `--guided-window 150` (vs. default 60) | frame 34, clean | 5 | 2.9% | 0.0190 / 0.0299 | **regression** - wider radius admits more false matches, dies 6 frames earlier |
+| 4 | `--n-features 10000` (vs. default 5000) | never bootstraps | 0 | 0% | n/a | **regression** - more low-quality candidate matches prevent bootstrap's dual-model dominance test from ever picking a winner, for the entire 613-frame sequence |
+| 5 | `--relocalize` | frame 40, then dead forever | 4 | 3.1% | 0.0194 / 0.0430 | **no-op** - 567 brute-force full-map attempts across the remaining 573 frames, 0 successes (stronger negative than the prior wrong-env result, which found 1 transient success) |
+| 6 | `--kf-min-tracked-points 20` | frame 46, then 449-frame blackout, coincidental reconnect at 495 | 9 (+1 late) | 70.5% (gapped) | 0.0523 / 0.0600 | **re-confirms the prior investigation's retracted finding, now under the correct environment** - real death delayed by only 6 frames (40->46), then the same pitfall-#1-style total blackout/coincidental-revisit pattern, not genuine survival |
+| 7 | `--kf-min-tracked-points 20 --kf-max-frames-since-keyframe 8` | frame 48, then 444-frame blackout, coincidental reconnect at 492 | 14 (+1 late) | 73.8% (gapped) | 0.0727 / 0.0605 | same as #6 - death delayed 8 frames, same blackout pattern |
+| 8 | `--kf-min-tracked-points 20 --relocalize` | identical to #6 | 9 (+1 late) | 70.5% (gapped) | 0.0523 / 0.0600 | **decisive** - even brute-force full-map search (544 attempts) finds nothing during the 449-frame gap; #6's reconnection at frame 495 happened via ordinary tracking once the camera physically returned, not because a better search found something earlier |
+| 9 | (prior session) BoW-vs-full-map candidate retrieval | both hit zero matches at the same frame | - | - | - | **no-op** - not a retrieval-scope problem |
+
+All eight (eight distinct mechanisms total across this and the prior
+session) are consistent
+with a single explanation, now tested from every angle the issue's own
+candidate list names: for roughly 450 frames after the whip-pan begins,
+**the camera's actual field of view shares no structure with anything
+this pipeline has ever triangulated**, regardless of search strategy
+(guided window, brute-force relocalization, BoW-style retrieval) or how
+aggressively keyframes get inserted beforehand (#7's near-every-frame
+keyframe insertion during the decline still only buys 8 frames). This
+isn't a matching/search deficiency - every mechanism that changes *how*
+the pipeline searches its existing map came back negative or worse.
+
+**Why the paper's own system doesn't have this problem, and why that
+doesn't mean nothing here is fixable:** every mechanism tested above is
+*reactive* - it can only match the current frame against structure
+triangulated from *past*, formally-promoted keyframes. None of them let
+the map grow into territory the pan is *currently* entering. The paper's
+concurrently-running Local Mapping thread doesn't need a smarter search
+either - because it runs continuously, it can opportunistically
+triangulate new structure from consecutive tracked frames as they happen,
+not just from the sparse, discretely-gated set of frames that clear this
+pipeline's keyframe-insertion policy (paper §V-E, unchanged from the
+paper's own values). Even test #7's near-maximal keyframe-insertion
+aggressiveness (keyframes at nearly every frame from 33-46) only delayed
+death by 8 frames - consistent with keyframe-gated triangulation
+fundamentally lagging one step behind an accelerating pan no matter how
+aggressively it's gated, since a keyframe still only captures what the
+camera already saw at the moment it's inserted.
+
+**Not concluding "unfixable within non-goals" here** - filed as
+[#49](https://github.com/albinjanssonsand/slam/issues/49): opportunistic
+frame-to-frame triangulation (new map points from consecutive *tracked*
+frames, not gated on keyframe promotion) during declining-inlier
+stretches, as a way to get the same continuous-growth property the
+paper's threading gives it, without threading - feasible here since this
+is an offline replay pipeline with no real-time frame-drop constraint,
+unlike the paper's live system. Real implementation work, not a parameter
+sweep; tracked as its own issue rather than folded into this one, per
+#47's own instruction to split out separately-landable pieces.
+
+**Reproduction:** same as part 1's snippet, with the flag combination from
+the table's row added to the `pipeline.mapping` invocation. Gap-check
+(`EVALUATION_METHOD.md` pitfall #1) required before trusting any coverage
+number above 4% on this sequence - rows 6-8 are exactly the pattern that
+pitfall exists to catch.
