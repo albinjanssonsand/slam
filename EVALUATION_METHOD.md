@@ -15,6 +15,10 @@ sequence's `groundtruth.txt`. `scripts/compare_trajectories.py` compares two
 estimates against one ground truth at once - use it once a change needs
 plotting against a prior baseline, rather than re-deriving numbers by eye.
 
+**Run `conda activate slam` (or invoke that env's `python.exe` directly)
+first - see pitfall #4 below before running any of this on a bare `python`
+from `PATH`.**
+
 **Reproduction** (for any sequence `<seq>` in `xyz`, `desk`, `room`, `rpy` -
 substitute the right `freiburg1`/`freiburg2`/`freiburg3` prefix and
 `calibration/tum_freiburg<N>.yaml` for sequences outside `freiburg1`):
@@ -143,10 +147,36 @@ being invoked is the project's real environment, not a coincidentally-
 compatible one found earlier on `PATH` (check `python -c "import sys;
 print(sys.executable)"` and compare package versions - `cv2.__version__` in
 particular, since a different OpenCV major version can change RANSAC/solver
-behavior, not just performance). This is not hypothetical: a full session's
-worth of evaluation runs were once executed against an unrelated Windows
-Store Python install with a different OpenCV major version (4.13 vs. the
-project's actual 5.0), silently, because both happened to have the
-project's dependencies importable. The numbers turned out to still hold
-once re-run in the real environment, but that was verified after the fact,
-not guaranteed - don't assume it, check it.
+behavior, not just performance). This is not hypothetical, and has happened
+**twice**: a full session's worth of evaluation runs was once executed
+against an unrelated Windows Store Python install with a different OpenCV
+major version (4.13 vs. the project's actual 5.0), silently, because both
+happened to have the project's dependencies importable - that first time,
+the numbers turned out to still hold once re-run in the real environment
+(verified after the fact, not guaranteed). It recurred during
+[#47](https://github.com/albinjanssonsand/slam/issues/47)'s investigation,
+and that time it did NOT just hold: on `freiburg1_desk`, both environments
+bootstrap identically (frame 7, model=F, R_H=0.39, same inlier/point
+counts) but diverge partway through per-frame PnP tracking - OpenCV 4.13
+survives 5 frames longer (to frame 45, 1 more keyframe) than 5.0's frame 40
+death point, a real, reproducible, version-dependent difference in
+`solvePnPRansac`'s behavior, not RNG noise (same-environment reruns of the
+identical command are byte-identical). Every "current main" number in this
+file predating #47's fix below should be assumed OpenCV-4.13-sourced unless
+a section explicitly says otherwise.
+
+**Concrete fix, checked in via [#47](https://github.com/albinjanssonsand/slam/issues/47):**
+`requirements.txt` now pins exact versions matching this project's real
+environment (a conda env named `slam`; `opencv-python==5.0.0.93`
+specifically). Before running anything here:
+
+```bash
+python -c "import sys, cv2; print(sys.executable); print(cv2.__version__)"
+```
+
+and confirm the interpreter path points into that environment and
+`cv2.__version__` starts with `5.0` - not just that the import succeeds.
+`conda activate slam` (or invoking that env's `python.exe` directly, e.g.
+`C:\Users\<you>\miniconda3\envs\slam\python.exe`) before any command in
+this file's Method/Reproduction sections is required, not optional; bare
+`python`/`pip` on `PATH` cannot be trusted to resolve there.

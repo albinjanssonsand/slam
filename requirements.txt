@@ -1,6 +1,7 @@
-opencv-python
-numpy
-pyyaml
-matplotlib
-scipy
-onnxruntime
+opencv-python==5.0.0.93
+numpy==2.5.1
+pyyaml==6.0.3
+matplotlib==3.11.1
+scipy==1.18.0
+onnxruntime==1.27.0
+evo==1.37.0  # evaluation only (EVALUATION_METHOD.md) - not imported by pipeline/

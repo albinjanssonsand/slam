@@ -2264,3 +2264,94 @@ evo_rpe tum datasets/tum/rgbd_dataset_freiburg1_desk/groundtruth.txt results/des
 See `EVALUATION_METHOD.md`'s pitfall #1 for the gap-check script used to
 produce the corrected table above - run it against any new `desk` log
 before trusting a coverage number from it.
+
+---
+
+## #47 (part 1): environment-mismatch fix and honest re-baseline
+
+**Version:** `issue-47-paper-parity-investigation` branch, `main` @
+`fc33419` unchanged - this section is a re-baseline, not a pipeline code
+change. Part of [#47](https://github.com/albinjanssonsand/slam/issues/47)'s
+investigation into why the pipeline underperforms the paper's own published
+numbers on `freiburg1_xyz`/`freiburg1_desk`.
+
+**Before any of #47's actual investigation, `EVALUATION_METHOD.md`
+pitfall #4 recurred - and this time it was NOT a harmless coincidence.**
+Bare `python`/`pip` on this machine's `PATH` resolve to a Windows Store
+Python 3.11 install with `opencv-python==4.13.0`; the project's real
+environment is a conda env named `slam`, with `opencv-python==5.0.0.93`.
+Every dependency the pipeline needs happens to import successfully under
+either, so nothing errors - the wrong environment runs silently, exactly as
+pitfall #4 already warned. Tested directly on `freiburg1_desk` (identical
+command, identical commit, only the interpreter differs): both environments
+bootstrap **identically** (frame 7, model=F, R_H=0.39, 332 pose inliers,
+318 points seeded) but diverge partway through per-frame guided PnP
+tracking - confirmed not RNG noise (two same-environment reruns of the
+identical command are byte-identical, aside from timing) but a real,
+reproducible difference in `cv2.solvePnPRansac`'s own behavior between
+OpenCV major versions:
+
+| Environment | Death frame | Keyframes | Active/total points | Coverage | ATE/RPE RMSE (m) |
+|---|---|---|---|---|---|
+| OpenCV 4.13 (Windows Store, wrong) | 45/613 | 5 | 542/1241 | 4.6% (1.07s/23.40s) | 0.0203 / 0.0545 |
+| OpenCV 5.0 (`slam` conda env, correct) | 40/613 | 4 | 482/1023 | 3.1% (0.73s/23.40s) | 0.0194 / 0.0430 |
+
+The OpenCV-4.13 row is byte-for-byte the same as every prior `desk` "current
+main" citation in this file (e.g. the keyframe-insertion-threshold-tuning
+section's default row above: frame 45/613, 4.6%, 0.0203/0.0545) - conclusive
+evidence that **every prior `freiburg1_desk` number in this file was
+produced under the wrong OpenCV version**, not the project's real
+environment. `freiburg1_xyz` was checked the same way for its current-`main`
+baseline (below) and is measurably affected too, though less dramatically -
+both environments track the whole sequence without loss, but the two-view
+bootstrap/PnP-tracking chain still ends up materially different by the end.
+
+**Fix:** `requirements.txt` now pins the exact versions verified working in
+the `slam` conda env (`opencv-python==5.0.0.93` specifically, since that's
+the version whose behavior every number in this file from here on should
+reflect); `EVALUATION_METHOD.md` pitfall #4 now names the environment
+explicitly and gives a copy-pasteable verification command, and its Method
+section points there before the reproduction snippet. This does not stop a
+future session from making the same mistake by hand, but it removes the
+silent-guessing failure mode - `pip install -r requirements.txt` into the
+wrong environment will now at least fail loudly on the version pin (or
+install the right version there) rather than quietly running.
+
+**Honest re-baseline, both sequences, current `main`, correct environment,
+default flags (no `--relocalize`/`--rotation-only-fallback`/
+`--global-ba-at-end`/`--depth-densify`):**
+
+| Sequence | Bootstrap frame | Keyframes | Active/total points | Coverage | ATE RMSE (m) | RPE RMSE (m) | Gap-check |
+|---|---|---|---|---|---|---|---|
+| `freiburg1_desk` | 7 (model=F, R_H=0.39) | 4 | 482/1023 | 3.1% (0.73s/23.40s) | 0.0194 | 0.0430 | clean - 34 contiguous tracked frames (7-40), then permanent loss, no gaps |
+| `freiburg1_xyz` | 4 (model=H, R_H=0.47) | 85 | 13511/47631 | 86.5% (26.04s/30.09s) | 0.0702 | 0.0898 | clean - 792 contiguous tracked frames (4-797), no gaps |
+
+**`freiburg1_desk` remains "too hard"** by this file's own criterion - a
+clean, un-gapped permanent loss at frame 40 (5 frames earlier than the
+mismeasured 45), 3.1% coverage. Nothing here changes its classification;
+the correct-environment number is honestly slightly worse (fewer frames
+survived) than the number every prior investigation of this sequence
+(including the keyframe-insertion-threshold-tuning and #13 relocalization
+sections above) was actually reasoning about.
+
+**`freiburg1_xyz` improves substantially just from fixing the environment,
+with no code change at all**: ATE RMSE 0.1129 -> 0.0702 (-38%), RPE RMSE
+0.1032 -> 0.0898 (-13%), at equivalent coverage (86.2% -> 86.5%) and fewer
+keyframes (95 -> 85) than the OpenCV-4.13 number #22's section reported as
+current-`main`. Still ~7.8x the paper's 0.90cm (vs. 12.5x under the
+mismeasured number), so this alone does not close the gap - but it means
+part of what #22's section attributed entirely to the R_H>0.45
+homography-selection heuristic was actually environment noise layered on
+top of that regression, not the regression alone. This is the correct
+starting point for #47's own further `xyz` investigation, not the
+0.1129/95-keyframe number cited in the issue itself.
+
+**Reproduction:**
+
+```bash
+conda activate slam  # or invoke that env's python.exe directly
+python -m pipeline.mapping --video datasets/tum/rgbd_dataset_freiburg1_<seq> --calibration calibration/tum_freiburg1.yaml --trajectory-output results/issue47_<seq>_baseline_estimate.txt --plot-output results/issue47_<seq>_baseline_trajectory.png --no-display
+
+evo_ape tum datasets/tum/rgbd_dataset_freiburg1_<seq>/groundtruth.txt results/issue47_<seq>_baseline_estimate.txt -a -s
+evo_rpe tum datasets/tum/rgbd_dataset_freiburg1_<seq>/groundtruth.txt results/issue47_<seq>_baseline_estimate.txt -a -s
+```
