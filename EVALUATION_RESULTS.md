@@ -2063,3 +2063,182 @@ on `freiburg1_xyz`, inherent to the paper's own R_H>0.45 threshold picking
 the "safe" model even on a borderline non-planar scene - reported
 transparently rather than masked by quietly deviating from the paper's
 pinned constants.
+
+---
+
+## Keyframe insertion threshold tuning (not tied to a filed issue)
+
+**Version:** `main` @ current HEAD (`--depth-densify`/`--relocalize`/
+`--rotation-only-fallback` not passed). Not scoped to a GitHub issue - this
+started as a direct comparison against the reference paper's own published
+numbers, and the investigation itself led to a concrete parameter change.
+
+### Does the paper even cover the sequences we call "too hard"?
+
+Checked directly against the actual paper (Mur-Artal et al., 2015,
+*"ORB-SLAM: A Versatile and Accurate Monocular SLAM System"*, arXiv:1502.00956,
+via its ar5iv full text):
+
+- **`freiburg2_pioneer_slam2` is not in the paper at all** - the word
+  "pioneer" does not appear anywhere in it, and its own TUM RGB-D table
+  (Table III, 16 hand-held sequences) doesn't include it either. It was
+  added to this project's evaluation suite by #17 for broader real-world
+  coverage, not to reproduce a published result - there is no paper number
+  to have fallen short of here.
+- **`freiburg1_desk` IS in the paper** (Table III): ORB-SLAM (monocular)
+  reports **1.69 cm ATE RMSE**, full-sequence tracking.
+- **`freiburg1_room` is NOT in the paper's Table III** either (confirmed
+  from the same fetch) - only `freiburg1_desk` gives a genuine apples-to-
+  apples target among this project's existing "too hard" sequences.
+
+So `freiburg1_desk` is the one sequence here with a real published number to
+compare against, and worth investigating properly: current `main` (pre this
+section) dies permanently at **frame 45/613** (4.6% coverage, 1.07s/23.4s),
+vs. the paper's implicit ~100% coverage.
+
+### Hypothesis 1 (rejected, tested directly): would BoW-style place
+recognition have found what full-map brute-force search misses?
+
+The obvious guess is that #13's relocalization (one flat brute-force
+Hamming match against the *entire* confirmed map, no keyframe-level
+retrieval) is a materially weaker substitute for the paper's DBoW2
+bag-of-words candidate retrieval (query an inverted visual-word index,
+retrieve candidate *keyframes* by appearance similarity, then match/verify
+against one keyframe's own point set at a time). Tested this directly
+rather than assumed it: dumped the real confirmed map from the `main`
+`freiburg1_desk` run above (6 keyframes, 542 active points at time of
+death) and, for frames 26-60, compared (a) `Map.match_against` over the
+WHOLE active map (#13's current approach) vs. (b) matching against each
+keyframe's own point subset individually, one at a time (what a BoW
+retrieval step would hand you) - same underlying matcher
+(`match_descriptors`, ratio test + mutual-NN cross-check per #14) and same
+PnP+RANSAC verification either way, so the only variable is candidate-pool
+scope.
+
+| frame | full-map matches / PnP inliers | best single-keyframe matches / inliers |
+|---|---|---|
+| 30 | 123 / 84 | 86 / 58 |
+| 40 | 90 / 38 | 65 / 28 |
+| 45 | 37 / 18 | 26 / 16 |
+| 49 | 11 / 0 | 9 / 0 |
+| 60 | 7 / 0 | 6 / 0 |
+
+**The flat full-map search wins on every single tested frame** - restricting
+to one keyframe's subset only throws away correct correspondences that
+happen to live in a different keyframe's own point set; different
+keyframes mostly cover different map locations rather than confusable
+near-duplicates, so a bigger pool adds true candidates more than it adds
+false ones. More importantly, **both approaches hit exactly zero matches at
+the same frame (~49) and stay there** for the rest of the tested range -
+not a retrieval-algorithm ceiling, but every keyframe's points, individually
+and combined, having genuinely left the frame. No candidate-retrieval
+strategy (BoW, brute force, or otherwise) can match a point to a view that
+never contains it. **Conclusion: this specific failure would not have been
+fixed by BoW-style place recognition.**
+
+### Hypothesis 2 (confirmed): is this actually a hard, fast pan, or ordinary motion?
+
+Checked ground truth directly rather than assumed either way:
+
+| segment | rotation rate | translation rate |
+|---|---|---|
+| frame 0->32 (healthy bootstrap+tracking) | 22.1 deg/s | 0.29 m/s |
+| **frame 32->49 (the death window)** | **61.5 deg/s** (~35 deg in 0.57s) | 0.38 m/s |
+| whole-sequence average | 0.9 deg/s | 0.05 m/s |
+
+Confirmed real: a genuine handheld whip-pan, ~3x the rotation rate of the
+immediately preceding healthy segment - not an artifact, and not "ordinary"
+motion. The paper's own system has to survive the same event, not an
+easier one.
+
+### Root cause (confirmed from the run log): the map stops growing exactly
+when it's needed most
+
+During frames 33-45 (inside the pan), per-frame PnP tracking keeps
+succeeding - declining inlier count (79 -> ... -> 24), but genuinely
+accepted, frame-only tracking, not lost. Yet **zero new keyframes get
+inserted for the entire 13-frame stretch**: `--kf-min-tracked-points`
+(paper's own §V-E condition 3, old default 50) is never satisfied while
+inlier count sits in the 24-79 range, so no new structure gets triangulated
+into the area the camera is panning toward while there is still some
+overlap left to build from. By the time inlier count reaches zero (~frame
+49), it's permanent - confirmed exhaustively by Hypothesis 1 above.
+
+### Parameter tuning, tested directly on `freiburg1_desk`
+
+| config | death point | coverage | ATE RMSE (m) | RPE RMSE (m) |
+|---|---|---|---|---|
+| default (`--kf-min-tracked-points 50`, `--kf-max-frames-since-keyframe 20`) | frame 45/613 | 4.6% | 0.0203 | 0.0545 |
+| `--kf-min-tracked-points 20` alone | tracking continues to frame 506+/613 | 70.1% | 0.0423 | 0.0629 |
+| `--kf-max-frames-since-keyframe 8` alone | frame 46/613 | 5.8% | 0.0299 | 0.0537 |
+| both together | tracking continues to frame 522+/613 | 73.8% | 0.0762 | 0.0574 |
+
+**`--kf-min-tracked-points 20` alone accounts for essentially the whole
+effect.** Lowering it to match `--pnp-min-inliers`'s own floor (20) makes
+condition 3 satisfied by construction whenever a frame's pose is accepted
+at all, instead of an independent, stricter bar that can block promotion
+even while tracking is genuinely still working - directly closing the
+13-frame growth gap diagnosed above. **`--kf-max-frames-since-keyframe 8`
+alone barely moves the needle** (frame 46 vs. 45) - a useful negative
+control confirming it wasn't the actual bottleneck: PnP itself was already
+rejecting frames outright via `--pnp-min-inliers` before even an 8-frame cap
+could ever fire. It only earns its keep in combination (70.1% -> 73.8%).
+
+ATE RMSE gets *worse*, not better, at the new defaults (0.0203 ->
+0.0762m) - the same "misleadingly good ATE at near-zero coverage" trap this
+doc has flagged since `freiburg1_desk`'s very first section: the old
+number scores a tiny, spatially-clustered early scribble; the new one
+scores a real ~74%-of-the-sequence trajectory, built from genuinely more
+permissive (down to 20-inlier) PnP solves the paper's own 50-point bar
+exists to keep out. Coverage, not ATE alone, is the metric that matters
+here, per this doc's own "too hard" methodology.
+
+### Regression check, `freiburg1_xyz` (already-healthy baseline)
+
+| config | keyframes | coverage | ATE RMSE (m) | RPE RMSE (m) |
+|---|---|---|---|---|
+| default | 102 | 86.2% | 0.1129 | 0.1032 |
+| `--kf-min-tracked-points 20` alone | 99 | 86.6% | 0.1135 | 0.1021 |
+| both together | 141 | 88.1% | 0.0687 | 0.0478 |
+
+**`--kf-min-tracked-points 20` alone is a clean no-op on `xyz`**: per-frame
+PnP inlier counts there run 600-1700+, nowhere near either the old (50) or
+new (20) floor, so this condition is never the binding constraint at
+either value - it only matters once tracking is already struggling, which
+never happens on this sequence. **Combining it with
+`--kf-max-frames-since-keyframe 8` does more than avoid a regression - it
+measurably improves `xyz`** (RPE RMSE -53%, ATE RMSE -39%) at the cost of
+~40% more keyframes (141 vs. 102) - more frequent forced keyframes
+apparently give local BA more frequent correction opportunities even on
+easy motion. Not cross-checked against run-to-run RANSAC-RNG variance (a
+documented source of noise elsewhere in this doc - see `#14`/`#13`'s own
+sections), so treat the exact percentages as directionally reliable rather
+than precise to the last digit.
+
+### Decision
+
+Ship both as the new defaults: `--kf-min-tracked-points 20` (was 50),
+`--kf-max-frames-since-keyframe 8` (was 20). Large, measured improvement on
+the hard sequence (`desk`: 4.6% -> 73.8% coverage), no regression - and a
+real bonus improvement - on the easy one (`xyz`).
+
+**Not a full fix for `freiburg1_desk`/`freiburg1_room`'s broader
+"too hard" classification.** `desk` at 73.8% coverage is a large
+improvement but still short of the paper's own full-sequence result, and
+`freiburg1_room` was not re-tested here: its own death (2 keyframes total,
+frame 29/1362, degenerate - `evo_ape` can't even align) happens during
+bootstrap itself, a different root cause than the keyframe-starvation
+mechanism this section targeted, so there's no specific reason to expect
+this change fixes it - an open question, not a claim either way.
+
+**Reproduction:**
+
+```bash
+python -m pipeline.mapping --video datasets/tum/rgbd_dataset_freiburg1_desk --calibration calibration/tum_freiburg1.yaml --trajectory-output results/desk_estimate.txt --plot-output results/desk_trajectory.png --no-display
+
+evo_ape tum datasets/tum/rgbd_dataset_freiburg1_desk/groundtruth.txt results/desk_estimate.txt -a -s
+evo_rpe tum datasets/tum/rgbd_dataset_freiburg1_desk/groundtruth.txt results/desk_estimate.txt -a -s
+```
+
+Add `--kf-min-tracked-points 50 --kf-max-frames-since-keyframe 20` to
+reproduce the pre-this-section defaults for comparison.
