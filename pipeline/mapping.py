@@ -1683,6 +1683,65 @@ def _create_new_points_from_covisible_keyframes(
     return point_ids, source_kf, source_pixels, new_kf_frame_idx, new_kf_pixels
 
 
+def _opportunistic_triangulate_from_frame(
+        sparse_map, ref_kf_idx, R_frame, t_frame, kp_frame, desc_frame,
+        already_matched_frame_idx, keyframe_poses, keyframe_kp, keyframe_desc,
+        camera_matrix, ratio, min_triangulation_angle, epipolar_max_error,
+        triangulation_max_reproj_chi2, triangulation_scale_ratio_factor,
+        max_covisible_keyframes):
+    """
+    #49: opportunistic new-point triangulation from an ordinarily-tracked
+    (non-keyframe) frame, for the specific case where PnP inlier count has
+    dropped below --kf-min-tracked-points - the paper's own §V-E condition
+    that blocks keyframe promotion, and with it §VI-C's usual new-point
+    search, exactly when the map most needs to grow into territory a fast
+    pan is currently entering (see EVALUATION_RESULTS.md's "#47 (part 2)"
+    investigation - every mechanism that only changes how the pipeline
+    searches its EXISTING map came back negative or worse; this is the
+    first one that lets the map grow between keyframes instead).
+
+    Reuses _create_new_points_from_covisible_keyframes exactly as keyframe
+    insertion's own §VI-C search does, treating this frame's own
+    already-accepted PnP pose as the second view - but since this frame is
+    NOT a keyframe, only the covisible keyframe's side of each new point's
+    founding observation gets registered (inside the reused helper, same as
+    always); this frame's own side (new_kf_frame_idx/new_kf_pixels) is
+    deliberately discarded rather than registered under any keyframe index.
+    A point created this way starts life with exactly one observing
+    keyframe (created_kf = ref_kf_idx, its sole founding observation also
+    ref_kf_idx's) - Map's own §VI-B culling (cull_new_points/
+    cull_low_observation_points, both keyed off created_kf) removes it
+    automatically at a later keyframe if it never accumulates the normal
+    3-observing-keyframe minimum, exactly like any other under-observed
+    point; no separate lifecycle needed.
+
+    Candidate keyframes to triangulate against: ref_kf_idx itself plus its
+    own covisibility-graph neighbors (most-shared-points-first, capped) -
+    there is no real "new keyframe" here to query covisibility for, so
+    ref_kf_idx stands in for it directly. Unlike _covisible_candidates'
+    fallback (which only adds fallback_kf_idx when it isn't already among
+    kf_idx's own ranked neighbors), ref_kf_idx is unconditionally first
+    here - it's the most relevant, most-likely-covisible candidate by
+    construction (it's what this frame was just tracked against), not a
+    fallback for an empty graph.
+
+    Returns the number of new points created.
+    """
+    edges = sparse_map.covisible_keyframes(ref_kf_idx)
+    neighbors = sorted(edges, key=lambda k: edges[k], reverse=True)
+    candidates = [ref_kf_idx] + [k for k in neighbors if k != ref_kf_idx]
+    candidates = candidates[:max_covisible_keyframes]
+
+    point_ids, _, _, _, _ = _create_new_points_from_covisible_keyframes(
+        sparse_map, ref_kf_idx, R_frame, t_frame, kp_frame, desc_frame,
+        already_matched_frame_idx, candidates,
+        keyframe_poses, keyframe_kp, keyframe_desc, camera_matrix,
+        ratio, min_triangulation_angle, epipolar_max_error,
+        triangulation_max_reproj_chi2, triangulation_scale_ratio_factor,
+    )
+    return len(point_ids)
+
+
 def _extend_new_points_to_other_covisible_keyframes(
         sparse_map, point_ids, source_kf, covisible_candidates,
         keyframe_poses, keyframe_kp, keyframe_desc, camera_matrix, window, ratio):
@@ -1924,6 +1983,31 @@ def _demo():
                               "extra calls either way, but one that does will shift OpenCV's "
                               "process-global RANSAC RNG state for the rest of the run - a real, "
                               "measured divergence, not just a performance cost")
+    parser.add_argument("--opportunistic-triangulation", action="store_true",
+                         help="Extension beyond the paper (#49, not part of ORB-SLAM's own "
+                              "design - see the issue): when an ordinarily-tracked frame's PnP "
+                              "inlier count drops below --kf-min-tracked-points (the paper's own "
+                              "§V-E condition that blocks keyframe promotion, and with it §VI-C's "
+                              "usual new-point search), triangulate new map points from this "
+                              "frame's already-accepted pose against the reference keyframe (and "
+                              "its covisibility neighbors) anyway - the same §VI-C search a real "
+                              "keyframe would run, reused as-is, treating this frame as a second "
+                              "view without promoting it to a keyframe. Only the reference "
+                              "keyframe's side of each new point's founding observation is "
+                              "registered (this frame is not a keyframe, so it can't observe "
+                              "anything in the Map's own bookkeeping); a point created this way "
+                              "starts with exactly one observing keyframe and is cleaned up "
+                              "automatically by the existing §VI-B culling rules at a later "
+                              "keyframe if it never accumulates the normal 3-observing-keyframe "
+                              "minimum. Exists because every mechanism that only changes how "
+                              "tracking searches its EXISTING map (guided window, brute-force "
+                              "relocalization, BoW-style retrieval - see EVALUATION_RESULTS.md's "
+                              "#47 (part 2)) failed to recover freiburg1_desk's whip-pan; this is "
+                              "the first one that lets the map grow between keyframes instead. Off "
+                              "by default: a sequence that never drops below --kf-min-tracked-"
+                              "points makes zero extra calls either way, but one that does will "
+                              "trigger extra RANSAC-free triangulation work (cheap - no PnP/"
+                              "RANSAC involved, just matching + epipolar check + DLT)")
     parser.add_argument("--ba-every", type=int, default=1,
                          help="Only run local bundle adjustment every Nth accepted keyframe "
                               "(default: every keyframe) - applies to the TRACK branch's "
@@ -2097,6 +2181,13 @@ def _demo():
     n_rotation_fallback_attempts = 0
     n_rotation_fallback_accepted = 0
     total_rotation_fallback_time = 0.0
+    # #49 opportunistic triangulation totals - n_opportunistic_attempts is
+    # every frame it fired on (PnP inliers below --kf-min-tracked-points),
+    # n_opportunistic_points the total new map points it created across all
+    # of them, same accounting convention as #13/#36 above.
+    n_opportunistic_attempts = 0
+    n_opportunistic_points = 0
+    total_opportunistic_time = 0.0
     # Previous frame's own ORB detection output (every frame, whether or not
     # it was tracked/became a keyframe) plus its frame index - the raw
     # material _rotation_only_fallback matches against, since it needs a
@@ -2672,14 +2763,39 @@ def _demo():
                                 status = f"KEYFRAME ({pnp_inliers} inliers, {len(sparse_map)} map points)"
                             else:
                                 n_tracked_only += 1
+                                # #49: the paper's own condition that just blocked keyframe
+                                # promotion (kf_min_tracked_ok) is exactly the "map isn't
+                                # growing into where the camera is heading" gap diagnosed in
+                                # EVALUATION_RESULTS.md's #47 investigation - triangulate new
+                                # points from this frame anyway, without promoting it.
+                                new_opportunistic_points = 0
+                                if args.opportunistic_triangulation and not kf_min_tracked_ok:
+                                    n_opportunistic_attempts += 1
+                                    ot_start = time.perf_counter()
+                                    new_opportunistic_points = _opportunistic_triangulate_from_frame(
+                                        sparse_map, ref_kf_idx, R_pos, t_pos, kp, desc,
+                                        set(frame_indices.tolist()),
+                                        keyframe_poses, keyframe_kp, keyframe_desc, K,
+                                        args.ratio, args.min_triangulation_angle,
+                                        args.epipolar_max_error,
+                                        args.triangulation_max_reproj_chi2,
+                                        args.triangulation_scale_ratio_factor,
+                                        args.new_point_max_covisible_keyframes,
+                                    )
+                                    n_opportunistic_points += new_opportunistic_points
+                                    total_opportunistic_time += time.perf_counter() - ot_start
                                 status = (
                                     f"TRACK ({pnp_inliers}/{len(map_indices)} PnP inliers, "
                                     f"frame-only)"
                                 )
+                                opportunistic_note = (
+                                    f"  +{new_opportunistic_points} opportunistic points"
+                                    if new_opportunistic_points else ""
+                                )
                                 print(f"frame {frame.index}: TRACK  parallax={parallax:.1f}px  "
                                       f"rotation={rot_deg:.1f}deg  "
                                       f"{pnp_inliers}/{len(map_indices)} PnP inliers "
-                                      f"(frame-only, not a keyframe)")
+                                      f"(frame-only, not a keyframe){opportunistic_note}")
 
                 # --- Rotation-only fallback (#36, extension beyond the paper):
                 # ordinary guided PnP against the map just failed THIS frame -
@@ -2994,6 +3110,14 @@ def _demo():
         )
         print(f"    [rotation-only fallback (#36): {n_rotation_fallback_attempts} attempts, "
               f"{n_rotation_fallback_accepted} succeeded, {total_rotation_fallback_time:.2f}s "
+              f"total ({avg_ms:.1f}ms/attempt)]")
+    if args.opportunistic_triangulation:
+        avg_ms = (
+            1000 * total_opportunistic_time / n_opportunistic_attempts
+            if n_opportunistic_attempts else 0.0
+        )
+        print(f"    [opportunistic triangulation (#49): {n_opportunistic_attempts} attempts, "
+              f"{n_opportunistic_points} new points created, {total_opportunistic_time:.2f}s "
               f"total ({avg_ms:.1f}ms/attempt)]")
     print(f"    [BA outlier discard (paper VI-D): {total_ba_outliers_discarded} observations "
           f"discarded across all BA passes, {total_culled_from_ba_outliers} point(s) removed "
