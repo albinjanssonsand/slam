@@ -6,46 +6,11 @@ diff between sections). Currently holds the geometric-only baseline
 (pre-ML); a section per `V2_INTEGRATION_PLAN.md` ML-depth-fusion phase gets
 added once that work lands.
 
-**Method:** `pipeline.mapping --trajectory-output` writes each accepted
-keyframe's pose in TUM format; `evo_ape`/`evo_rpe ... -a -s` (Sim(3)
-alignment - required since this pipeline's monocular scale isn't metric)
-score it against each sequence's `groundtruth.txt`. `scripts/compare_trajectories.py`
-isn't used here since it compares two estimates against one ground truth at
-once and there's only one pipeline version per section so far - it becomes
-the right tool once a later phase needs plotting against this baseline.
-
-**"Too hard" criterion:** a dataset is too hard if the pipeline never
-produces a usable trajectory (crash, or too few keyframes for `evo`'s
-Umeyama fit), **or** if it does produce ATE/RPE but at low **trajectory
-coverage** (estimate duration / ground-truth duration, from each file's
-first/last timestamp). The second case matters because this pipeline has no
-relocalization: a run that loses tracking early just stops producing
-keyframes, and `evo`'s Sim(3) alignment then fits well to a small,
-temporally-clustered handful of early poses - a deceptively low ATE for a
-trajectory that covers almost none of the real motion. Coverage catches
-this; ATE/RPE alone don't.
-
-**Reproduction** (for any sequence `<seq>` in `xyz`, `desk`, `room`, `rpy`):
-
-```bash
-python -m pipeline.mapping \
-  --video datasets/tum/rgbd_dataset_freiburg1_<seq> \
-  --calibration calibration/tum_freiburg1.yaml \
-  --trajectory-output results/geometric_<seq>_estimate.txt \
-  --plot-output results/geometric_<seq>_trajectory.png \
-  --no-display
-
-evo_ape tum datasets/tum/rgbd_dataset_freiburg1_<seq>/groundtruth.txt results/geometric_<seq>_estimate.txt -a -s
-evo_rpe tum datasets/tum/rgbd_dataset_freiburg1_<seq>/groundtruth.txt results/geometric_<seq>_estimate.txt -a -s
-
-python scripts/plot_trajectory.py \
-  --estimate results/geometric_<seq>_estimate.txt \
-  --groundtruth datasets/tum/rgbd_dataset_freiburg1_<seq>/groundtruth.txt \
-  --output results/geometric_<seq>_vs_groundtruth.png
-```
-
-Trajectory coverage isn't computed by any script - read the first/last
-timestamp (column 1) of the estimate and of `groundtruth.txt`, divide.
+**Read `EVALUATION_METHOD.md` before adding a section here or trusting one
+already here** - it has the reproduction commands, the "too hard" criterion,
+and (important) a list of known pitfalls in this methodology, including one
+that previously produced a real, shipped-then-reverted false result on
+`freiburg1_desk` (see that section below for the corrected writeup).
 
 ---
 
@@ -2066,7 +2031,7 @@ pinned constants.
 
 ---
 
-## Keyframe insertion threshold tuning (not tied to a filed issue)
+## Keyframe insertion threshold tuning - tried, reverted (not tied to a filed issue)
 
 **Version:** `main` @ current HEAD (`--depth-densify`/`--relocalize`/
 `--rotation-only-fallback` not passed). Not scoped to a GitHub issue - this
@@ -2164,36 +2129,75 @@ into the area the camera is panning toward while there is still some
 overlap left to build from. By the time inlier count reaches zero (~frame
 49), it's permanent - confirmed exhaustively by Hypothesis 1 above.
 
-### Parameter tuning, tested directly on `freiburg1_desk`
+### Parameter tuning, tested directly on `freiburg1_desk` - initial result (later corrected below)
 
 | config | death point | coverage | ATE RMSE (m) | RPE RMSE (m) |
 |---|---|---|---|---|
 | default (`--kf-min-tracked-points 50`, `--kf-max-frames-since-keyframe 20`) | frame 45/613 | 4.6% | 0.0203 | 0.0545 |
-| `--kf-min-tracked-points 20` alone | tracking continues to frame 506+/613 | 70.1% | 0.0423 | 0.0629 |
+| `--kf-min-tracked-points 20` alone | "tracking continues to" frame 506+/613 | 70.1% | 0.0423 | 0.0629 |
 | `--kf-max-frames-since-keyframe 8` alone | frame 46/613 | 5.8% | 0.0299 | 0.0537 |
-| both together | tracking continues to frame 522+/613 | 73.8% | 0.0762 | 0.0574 |
+| both together | "tracking continues to" frame 522+/613 | 73.8% | 0.0762 | 0.0574 |
 
-**`--kf-min-tracked-points 20` alone accounts for essentially the whole
-effect.** Lowering it to match `--pnp-min-inliers`'s own floor (20) makes
-condition 3 satisfied by construction whenever a frame's pose is accepted
-at all, instead of an independent, stricter bar that can block promotion
-even while tracking is genuinely still working - directly closing the
-13-frame growth gap diagnosed above. **`--kf-max-frames-since-keyframe 8`
-alone barely moves the needle** (frame 46 vs. 45) - a useful negative
-control confirming it wasn't the actual bottleneck: PnP itself was already
-rejecting frames outright via `--pnp-min-inliers` before even an 8-frame cap
-could ever fire. It only earns its keep in combination (70.1% -> 73.8%).
+This was read at the time as "`--kf-min-tracked-points 20` accounts for
+essentially the whole effect, closing the 13-frame growth gap diagnosed
+above" - **that reading was wrong, caught only after a user directly
+questioned a suspiciously low keyframe count (14, for a 613-frame
+sequence) and asked to see the run log.** The "death point"/"tracking
+continues to" language above is quoted because it doesn't mean what it
+sounds like - see the correction immediately below. This is the incident
+that produced `EVALUATION_METHOD.md`'s pitfall #1; read that section for
+the general lesson, this one for the specific numbers.
 
-ATE RMSE gets *worse*, not better, at the new defaults (0.0203 ->
-0.0762m) - the same "misleadingly good ATE at near-zero coverage" trap this
-doc has flagged since `freiburg1_desk`'s very first section: the old
-number scores a tiny, spatially-clustered early scribble; the new one
-scores a real ~74%-of-the-sequence trajectory, built from genuinely more
-permissive (down to 20-inlier) PnP solves the paper's own 50-point bar
-exists to keep out. Coverage, not ATE alone, is the metric that matters
-here, per this doc's own "too hard" methodology.
+### Corrected: the coverage number was hiding a 444-frame total blackout
 
-### Regression check, `freiburg1_xyz` (already-healthy baseline)
+Applying the gap-check now documented in `EVALUATION_METHOD.md` to these
+same runs' own logs (every accepted-pose frame prints a `frame N:` line;
+extract the indices, look at the gaps) tells a completely different story
+than the table above:
+
+| config | frames w/ an accepted pose | last frame before the gap | first frame after it | gap size |
+|---|---|---|---|---|
+| default (50/20) | 44 | 45 | *(never reconnects)* | stays dead for the remaining 568 frames |
+| `--kf-min-tracked-points 20` alone | 61 | 46 | 492 | 446 frames, zero accepted poses |
+| both together | 81 | 48 | 492 | 444 frames, zero accepted poses |
+
+**The death point barely moves at all (45 -> 46-48) - a few frames, within
+run-to-run noise, not a fix.** Both "improved" configurations then go
+completely dark - not "fewer keyframes", genuinely zero accepted poses of
+any kind, guided or otherwise - for well over 400 straight frames, before a
+handful of keyframes suddenly appear again starting at frame 492. That is
+not survived tracking; it's a fresh, coincidental reconnection. Verified
+directly against `groundtruth.txt` rather than assumed: frame 492's camera
+position (`[1.40, 0.45, 1.68]`) sits within about 10cm of frame 32-44's
+positions (`[1.29-1.38, 0.52-0.66, 1.57-1.59]`) - after wandering far away
+through the middle of the sequence (X ranging roughly -0.7 to 0.9 around
+frames 100-400), the camera genuinely revisits the original desk area, and
+*that* is what frame 492's keyframe is - a real, physical revisit, not
+noise. The default (untuned) run's trajectory presumably passes through
+the same physical area at the same later timestamp too, but never
+reconnects there at all; the difference is that the two tuned
+configurations bank more keyframes/points before dying (8 vs. 4), giving
+that later revisit a denser residual map to find enough correspondences in
+via ordinary guided matching - `--relocalize` was not even enabled for any
+of these runs, so this isn't relocalization either. This is a real,
+reproducible, now ground-truth-confirmed mechanism - but it is a
+*different* mechanism than "fixes the whip-pan," it is specific to this
+video happening to loop back near its own start, and it produces a
+trajectory that is badly wrong (frozen at a stale pose) for the 444 frames
+in between, which the coverage number gives no hint of.
+
+This also *strengthens*, rather than contradicts, the root-cause diagnosis
+above: even with keyframes inserted continuously right up through frame 44
+(confirmed in the "both together" run - keyframes at 8, 13, 21, 29, 33, 40,
+42, 44, vs. the default's 8, 13, 22, 32), overlap with the confirmed map
+still collapses to zero within a few more frames regardless. Lowering
+`--kf-min-tracked-points` does exactly what it was diagnosed to do (let
+more keyframes in during the declining-but-tracked stretch) - it just
+isn't *sufficient* to survive this particular whip-pan once inlier count
+actually reaches zero, which happens only a handful of frames later than
+before either way.
+
+### Regression check, `freiburg1_xyz` - unaffected by the correction above
 
 | config | keyframes | coverage | ATE RMSE (m) | RPE RMSE (m) |
 |---|---|---|---|---|
@@ -2201,35 +2205,52 @@ here, per this doc's own "too hard" methodology.
 | `--kf-min-tracked-points 20` alone | 99 | 86.6% | 0.1135 | 0.1021 |
 | both together | 141 | 88.1% | 0.0687 | 0.0478 |
 
-**`--kf-min-tracked-points 20` alone is a clean no-op on `xyz`**: per-frame
-PnP inlier counts there run 600-1700+, nowhere near either the old (50) or
-new (20) floor, so this condition is never the binding constraint at
-either value - it only matters once tracking is already struggling, which
-never happens on this sequence. **Combining it with
-`--kf-max-frames-since-keyframe 8` does more than avoid a regression - it
-measurably improves `xyz`** (RPE RMSE -53%, ATE RMSE -39%) at the cost of
-~40% more keyframes (141 vs. 102) - more frequent forced keyframes
-apparently give local BA more frequent correction opportunities even on
-easy motion. Not cross-checked against run-to-run RANSAC-RNG variance (a
-documented source of noise elsewhere in this doc - see `#14`/`#13`'s own
-sections), so treat the exact percentages as directionally reliable rather
-than precise to the last digit.
+These numbers are NOT subject to the pitfall above: `xyz`'s own run log
+shows only 5 of 698 non-keyframe frames "lost tracking entirely" in every
+configuration (vs. `desk`'s 537 of 598) - genuinely continuous tracking
+throughout, not a gapped coverage artifact, and `evo`'s Sim(3) alignment
+scores every matched timestamp, not just the first/last. `--kf-min-tracked-
+points 20` alone is a clean no-op here (inlier counts run 600-1700+,
+nowhere near either floor); combined with `--kf-max-frames-since-keyframe
+8` it measurably improves both ATE and RPE (~40% more keyframes). This part
+of the investigation holds - it just no longer motivates keeping the
+changed defaults on its own, since the primary (`desk`) justification is
+gone.
 
-### Decision
+### Decision (revised)
 
-Ship both as the new defaults: `--kf-min-tracked-points 20` (was 50),
-`--kf-max-frames-since-keyframe 8` (was 20). Large, measured improvement on
-the hard sequence (`desk`: 4.6% -> 73.8% coverage), no regression - and a
-real bonus improvement - on the easy one (`xyz`).
+**Reverted both to the paper's own values**: `--kf-min-tracked-points 50`
+(was briefly 20), `--kf-max-frames-since-keyframe 20` (was briefly 8). The
+original justification - a demonstrated fix for `freiburg1_desk`'s
+tracking-loss death spiral - did not hold up under the gap-check above.
+Shipping a parameter change under a "fixes the whip-pan" framing that
+instead produces 444 frames of silently-wrong frozen-pose output between
+two real tracking islands would be actively misleading to anyone relying
+on this doc or these defaults, regardless of how good the raw coverage
+number looks.
 
-**Not a full fix for `freiburg1_desk`/`freiburg1_room`'s broader
-"too hard" classification.** `desk` at 73.8% coverage is a large
-improvement but still short of the paper's own full-sequence result, and
-`freiburg1_room` was not re-tested here: its own death (2 keyframes total,
-frame 29/1362, degenerate - `evo_ape` can't even align) happens during
-bootstrap itself, a different root cause than the keyframe-starvation
-mechanism this section targeted, so there's no specific reason to expect
-this change fixes it - an open question, not a claim either way.
+**What still holds, unretracted:** the paper-gap analysis
+(`freiburg2_pioneer_slam2` isn't in the reference paper at all;
+`freiburg1_desk` is, at 1.69cm ATE), the BoW-vs-brute-force rejection
+(Hypothesis 1 - independently valid, since it compared match/inlier counts
+directly rather than a timestamp-derived coverage percentage, so it isn't
+subject to this pitfall), the ground-truth whip-pan confirmation
+(Hypothesis 2), and the root-cause diagnosis (map growth frozen by
+`--kf-min-tracked-points` during a declining-but-tracked stretch) - if
+anything the root cause is now better confirmed, not weaker, by seeing that
+fixing it wasn't sufficient on its own.
+
+**What's retracted:** the claim that lowering `--kf-min-tracked-points`/
+`--kf-max-frames-since-keyframe` fixes `freiburg1_desk`'s tracking loss, and
+the "no regression, plus a bonus win" framing for shipping them as new
+defaults on that basis. `freiburg1_desk`/`freiburg1_room` remain "too hard"
+per this doc's own criterion, un-improved by this investigation. A genuine
+fix still needs something this investigation didn't find - possibly denser
+feature coverage through the pan, a wider guided-matching search
+specifically during a detected fast-rotation regime, or accepting that a
+whip-pan this severe needs a live recovery mechanism (relocalization,
+loop closing) reaching the later revisit *during* the run, rather than a
+denser residual map passively catching it after the fact.
 
 **Reproduction:**
 
@@ -2240,5 +2261,6 @@ evo_ape tum datasets/tum/rgbd_dataset_freiburg1_desk/groundtruth.txt results/des
 evo_rpe tum datasets/tum/rgbd_dataset_freiburg1_desk/groundtruth.txt results/desk_estimate.txt -a -s
 ```
 
-Add `--kf-min-tracked-points 50 --kf-max-frames-since-keyframe 20` to
-reproduce the pre-this-section defaults for comparison.
+See `EVALUATION_METHOD.md`'s pitfall #1 for the gap-check script used to
+produce the corrected table above - run it against any new `desk` log
+before trusting a coverage number from it.
