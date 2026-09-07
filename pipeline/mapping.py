@@ -877,6 +877,112 @@ def _bootstrap_dual_model(ref_kp, kp, matches, pts1, pts2, camera_matrix,
     )
 
 
+def _rotation_only_fallback(pts1, pts2, camera_matrix, min_pose_inliers,
+                             max_rotation_deg, homography_select_threshold=0.45):
+    """
+    #36's rotation-only tracking fallback: an extension beyond the paper
+    (which has no such mode - see the issue), for the specific case where
+    per-frame guided PnP tracking against the map has just failed on a
+    frame whose motion since the previous frame turns out to be
+    (near-)pure rotation. Triangulation - and therefore PnP against a map
+    built from it - fundamentally needs camera-center translation to work
+    at all; during a sustained pure-rotation pan there simply isn't any,
+    so instead of freezing the pose prediction (which is what happens
+    without this fallback - see mapping._demo's predict_constant_velocity
+    docstring), estimate the relative rotation directly from ordinary 2D-2D
+    ORB matches between the previous frame and this one via a homography (no
+    3D map needed at all, unlike PnP/triangulation), and carry it forward as
+    a zero-translation pose update - keeping the pose estimate alive (and,
+    fed back in as next frame's motion prediction, keeping guided matching's
+    search centered close to the true pose) through the degenerate segment
+    so ordinary tracking can resume immediately once real translation
+    returns, rather than needing a full relocalization.
+
+    Detecting "is this actually pure rotation" reuses the paper's own §IV
+    R_H model-selection heuristic (see _bootstrap_dual_model): a homography
+    and a fundamental matrix are estimated in parallel over the SAME
+    frame-to-frame matches and scored by symmetric transfer error
+    (pose.homography_score/fundamental_score); a fundamental matrix that
+    explains the correspondences comparably well or better (R_H at or below
+    homography_select_threshold) means there's real parallax to exploit
+    and this fallback should defer to relocalization/normal recovery
+    instead of forcing a zero-translation assumption onto a scene that
+    doesn't actually have one.
+
+    Once homography is preferred, decompose_homography's rotation
+    hypotheses are disambiguated WITHOUT triangulation (there's no second
+    baseline to triangulate against here, unlike bootstrap) by checking how
+    well each hypothesis's own implied zero-translation homography
+    (pose.pure_rotation_homography) explains the SAME correspondences via
+    homography_score - the hypothesis whose rotation alone reproduces the
+    observed motion best is the one kept. The result is sanity-checked
+    against max_rotation_deg (the same implausible-single-frame-rotation
+    bound ordinary PnP tracking applies via --max-plausible-rotation) since
+    a degenerate/near-planar correspondence set can still make homography
+    decomposition return a wildly wrong rotation.
+
+    Returns None if there's not enough data to attempt this at all (fewer
+    than 8 matches, or the homography RANSAC fit itself fails) - the
+    caller's existing status reporting covers this the same as every other
+    "couldn't even attempt a pose" path elsewhere in this pipeline.
+    Otherwise always returns a dict (whether or not accepted), so the
+    caller can report the R_H trend and rejection reason every attempt,
+    same convention as _bootstrap_dual_model:
+      accepted   - bool
+      R_H        - float, the Eq. 3-style score (see _bootstrap_dual_model)
+      n_inliers  - the homography RANSAC inlier count
+    When accepted, additionally:
+      R_rel        - the winning hypothesis's relative rotation (previous
+                     frame -> this frame); translation is deliberately not
+                     returned at all - the caller composes the new pose
+                     with a hard zero translation, not an estimate, since
+                     this whole path only exists because there's no
+                     translation to estimate in the first place
+      rotation_deg - R_rel's rotation magnitude (deg), the same figure
+                     checked against max_rotation_deg above
+    """
+    from pipeline.pose import (
+        decompose_homography, estimate_fundamental_matrix, estimate_homography,
+        fundamental_score, homography_score, pure_rotation_homography, rotation_angle_deg,
+    )
+
+    if len(pts1) < 8:
+        return None
+
+    h_result = estimate_homography(pts1, pts2)
+    if h_result is None:
+        return None
+    H, mask = h_result
+    n_inliers = int(mask.ravel().astype(bool).sum())
+
+    f_result = estimate_fundamental_matrix(pts1, pts2)
+    S_H = homography_score(H, pts1, pts2)
+    S_F = fundamental_score(f_result[0], pts1, pts2) if f_result is not None else 0.0
+    total = S_H + S_F
+    R_H = S_H / total if total > 0 else 0.0
+
+    base = dict(R_H=R_H, n_inliers=n_inliers)
+    homography_preferred = f_result is None or R_H > homography_select_threshold
+    if not homography_preferred or n_inliers < min_pose_inliers:
+        return dict(base, accepted=False)
+
+    hypotheses = decompose_homography(H, camera_matrix)
+    if not hypotheses:
+        return dict(base, accepted=False)
+
+    R_best, best_score = None, -np.inf
+    for R_h, _ in hypotheses:
+        score = homography_score(pure_rotation_homography(R_h, camera_matrix), pts1, pts2)
+        if score > best_score:
+            R_best, best_score = R_h, score
+
+    rotation_deg = rotation_angle_deg(R_best)
+    if rotation_deg > max_rotation_deg:
+        return dict(base, accepted=False, rotation_deg=rotation_deg)
+
+    return dict(base, accepted=True, R_rel=R_best, rotation_deg=rotation_deg)
+
+
 def _run_ba(keyframe_poses, keyframe_observations, sparse_map, camera_matrix,
             free_kfs, fixed_kfs, point_ids, max_points, max_nfev, ftol, xtol,
             outlier_chi2_threshold=5.991):
@@ -1781,6 +1887,35 @@ def _demo():
                               "likely recover from on its own next frame (see "
                               "n_consecutive_untracked, which also drives match_against_guided's "
                               "own search-radius widening)")
+    parser.add_argument("--rotation-only-fallback", action="store_true",
+                         help="Extension beyond the paper (#36, not part of ORB-SLAM's own "
+                              "design - see the issue): when per-frame guided PnP tracking "
+                              "against the map fails, attempt a homography-based rotation-only "
+                              "pose estimate between this frame and the immediately previous "
+                              "one instead of leaving the motion prediction frozen. Triangulation "
+                              "(and therefore PnP against the map it builds) needs camera-center "
+                              "translation to work at all; during a sustained near-pure-rotation "
+                              "pan there isn't any, so no tunable threshold can rescue normal "
+                              "tracking there. This estimates the relative rotation directly from "
+                              "ordinary 2D-2D ORB matches (no 3D map needed) and carries it "
+                              "forward as a zero-translation pose update - see "
+                              "mapping._rotation_only_fallback - so guided matching's next-frame "
+                              "search stays centered near the true pose and ordinary PnP tracking "
+                              "can resume immediately once real translation returns, without "
+                              "needing a full relocalization. Complementary to --relocalize, not "
+                              "overlapping: this keeps a live pose through a specific, detectable "
+                              "degenerate-motion regime so a full loss/recovery cycle is avoided "
+                              "in the first place; attempted every frame normal tracking fails "
+                              "(not gated by a consecutive-failure count like --relocalize), but "
+                              "self-limiting - it only overrides the frozen prediction when its "
+                              "own R_H model-selection check confirms the motion actually looks "
+                              "rotation-dominated. Does NOT grow the map or insert keyframes "
+                              "during the fallback (no new structure is possible without "
+                              "translation-derived depth, by any method). Off by default: like "
+                              "--relocalize, a sequence whose tracking never needs this makes zero "
+                              "extra calls either way, but one that does will shift OpenCV's "
+                              "process-global RANSAC RNG state for the rest of the run - a real, "
+                              "measured divergence, not just a performance cost")
     parser.add_argument("--ba-every", type=int, default=1,
                          help="Only run local bundle adjustment every Nth accepted keyframe "
                               "(default: every keyframe) - applies to the TRACK branch's "
@@ -1945,6 +2080,23 @@ def _demo():
     n_relocalize_attempts = 0
     n_relocalized = 0
     total_relocalize_time = 0.0
+    # #36 rotation-only fallback totals - same accounting convention as #13's
+    # relocalization counters above. n_rotation_fallback_accepted frames are
+    # tracked (pose stays live) but deliberately never promoted to a
+    # keyframe (see _rotation_only_fallback's docstring) - the final report
+    # subtracts it from n_skipped alongside n_tracked_only so those frames
+    # aren't miscounted as "lost tracking entirely".
+    n_rotation_fallback_attempts = 0
+    n_rotation_fallback_accepted = 0
+    total_rotation_fallback_time = 0.0
+    # Previous frame's own ORB detection output (every frame, whether or not
+    # it was tracked/became a keyframe) plus its frame index - the raw
+    # material _rotation_only_fallback matches against, since it needs a
+    # strictly-consecutive frame-to-frame baseline, not the (possibly much
+    # older) reference keyframe ref_kp/ref_desc.
+    prev_frame_kp = None
+    prev_frame_desc = None
+    prev_frame_index = None
     # §VI-B culling totals across the whole run, for the final report.
     total_culled_trial = 0
     total_culled_ongoing = 0
@@ -2012,6 +2164,7 @@ def _demo():
                 cur_pose_frame = frame.index
                 keyframe_poses[0] = KeyframePose(R_pos, t_pos, frame.timestamp)
                 keyframe_kp[0], keyframe_desc[0] = kp, desc
+                prev_frame_kp, prev_frame_desc, prev_frame_index = kp, desc, frame.index
                 continue
 
             frames_since_last_keyframe += 1
@@ -2520,6 +2673,78 @@ def _demo():
                                       f"{pnp_inliers}/{len(map_indices)} PnP inliers "
                                       f"(frame-only, not a keyframe)")
 
+                # --- Rotation-only fallback (#36, extension beyond the paper):
+                # ordinary guided PnP against the map just failed THIS frame -
+                # try a homography-based rotation-only estimate between the
+                # immediately previous frame and this one instead of leaving
+                # the motion prediction frozen (see _rotation_only_fallback).
+                # Unlike relocalization below, attempted on every frame normal
+                # tracking fails, not gated by a consecutive-failure count -
+                # it needs no map at all (just the previous frame's own ORB
+                # output, always available) and is self-limiting: it only
+                # overrides the frozen prediction once its own R_H check
+                # confirms the motion actually looks rotation-dominated, so
+                # there's no real cost to trying every time on a healthy
+                # sequence where it essentially never fires. Deliberately
+                # does NOT touch is_keyframe/map structure/recent_step_sizes -
+                # see the flag's own --help and _rotation_only_fallback's
+                # docstring for why (no translation means no new depth is
+                # possible, by any method, and camera center is held fixed by
+                # construction so there's no step size to record).
+                #
+                # Requires frame.index - cur_pose_frame == 1 (not just a
+                # consecutive previous FRAME, checked separately below) -
+                # R_pos/t_pos is the pose this frame's estimate would be
+                # composed onto, and it only represents frame cur_pose_frame.
+                # If an earlier frame's own fallback attempt (or normal
+                # tracking) failed, cur_pose_frame is stale by more than one
+                # frame even though prev_frame_kp/desc (updated every frame
+                # unconditionally, success or not) still looks like a valid
+                # consecutive baseline - composing this frame's previous-
+                # frame-relative rotation onto that stale pose would silently
+                # skip whatever motion happened in between, corrupting the
+                # chain rather than merely failing to extend it. This does
+                # mean a single bad frame partway through a longer degenerate
+                # stretch ends the fallback for the rest of it (falling back
+                # to relocalization/frozen prediction like before #36) rather
+                # than resuming - a real, honest limitation, not a bug: it's
+                # the same continuity requirement predict_constant_velocity
+                # itself already applies (see its own docstring) rather than
+                # a weaker one invented just for this path. ---
+                rotation_fallback_accepted = False
+                if (
+                    not track_accepted and args.rotation_only_fallback
+                    and prev_frame_kp is not None and frame.index - prev_frame_index == 1
+                    and cur_pose_frame is not None and frame.index - cur_pose_frame == 1
+                ):
+                    n_rotation_fallback_attempts += 1
+                    rf_start = time.perf_counter()
+                    frame_matches = match_descriptors(prev_frame_desc, desc, args.ratio)
+                    if len(frame_matches) >= 8:
+                        rf_pts1 = np.float32([prev_frame_kp[m.queryIdx].pt for m in frame_matches])
+                        rf_pts2 = np.float32([kp[m.trainIdx].pt for m in frame_matches])
+                        rf_result = _rotation_only_fallback(
+                            rf_pts1, rf_pts2, K,
+                            min_pose_inliers=args.min_inliers,
+                            max_rotation_deg=args.max_plausible_rotation,
+                        )
+                        if rf_result is not None and rf_result["accepted"]:
+                            R_rel = rf_result["R_rel"]
+                            R_new, t_new = compose_pose(R_pos, t_pos, R_rel, np.zeros((3, 1)))
+                            rotation_fallback_accepted = True
+                            n_rotation_fallback_accepted += 1
+                            prev_pose = (R_pos, t_pos)
+                            prev_pose_frame = cur_pose_frame
+                            R_pos, t_pos = R_new, t_new
+                            cur_pose_frame = frame.index
+                            status = (
+                                f"ROTATION-ONLY FALLBACK (R_H={rf_result['R_H']:.2f}, "
+                                f"{rf_result['n_inliers']}/{len(frame_matches)} homography "
+                                f"inliers, rotation={rf_result['rotation_deg']:.1f}deg)"
+                            )
+                            print(f"frame {frame.index}: {status}")
+                    total_rotation_fallback_time += time.perf_counter() - rf_start
+
                 # --- Relocalization (#13): ordinary guided tracking above
                 # has now failed --relocalize-after-frames frames in a row -
                 # try a wide, unguided search against the ENTIRE active map
@@ -2538,7 +2763,7 @@ def _demo():
                 # a single skipped frame (which guided matching often
                 # recovers from on its own) shouldn't have to pay.
                 if (
-                    not track_accepted and args.relocalize
+                    not track_accepted and not rotation_fallback_accepted and args.relocalize
                     and n_consecutive_untracked >= args.relocalize_after_frames
                 ):
                     n_relocalize_attempts += 1
@@ -2645,7 +2870,10 @@ def _demo():
                                     ref_kf_tracked_count = None
                     total_relocalize_time += time.perf_counter() - reloc_start
 
-                n_consecutive_untracked = 0 if track_accepted else n_consecutive_untracked + 1
+                n_consecutive_untracked = (
+                    0 if (track_accepted or rotation_fallback_accepted)
+                    else n_consecutive_untracked + 1
+                )
 
             if not args.no_display:
                 match_vis = cv2.drawMatches(
@@ -2730,6 +2958,8 @@ def _demo():
             else:
                 n_skipped += 1
 
+            prev_frame_kp, prev_frame_desc, prev_frame_index = kp, desc, frame.index
+
     if not args.no_display:
         cv2.destroyAllWindows()
 
@@ -2739,7 +2969,8 @@ def _demo():
           f"{total_culled_ongoing} removed by the ongoing <3-observing-keyframe rule), "
           f"{n_skipped} frames not promoted to a keyframe "
           f"({n_tracked_only} still tracked frame-only, "
-          f"{n_skipped - n_tracked_only} lost tracking entirely)")
+          f"{n_rotation_fallback_accepted} tracked via rotation-only fallback, "
+          f"{n_skipped - n_tracked_only - n_rotation_fallback_accepted} lost tracking entirely)")
     if args.relocalize:
         avg_ms = (
             1000 * total_relocalize_time / n_relocalize_attempts
@@ -2748,6 +2979,14 @@ def _demo():
         print(f"    [relocalization (#13): {n_relocalize_attempts} attempts, "
               f"{n_relocalized} succeeded, {total_relocalize_time:.2f}s total "
               f"({avg_ms:.1f}ms/attempt)]")
+    if args.rotation_only_fallback:
+        avg_ms = (
+            1000 * total_rotation_fallback_time / n_rotation_fallback_attempts
+            if n_rotation_fallback_attempts else 0.0
+        )
+        print(f"    [rotation-only fallback (#36): {n_rotation_fallback_attempts} attempts, "
+              f"{n_rotation_fallback_accepted} succeeded, {total_rotation_fallback_time:.2f}s "
+              f"total ({avg_ms:.1f}ms/attempt)]")
     print(f"    [BA outlier discard (paper VI-D): {total_ba_outliers_discarded} observations "
           f"discarded across all BA passes, {total_culled_from_ba_outliers} point(s) removed "
           f"by the ongoing <3-observing-keyframe rule as a direct result - previously "

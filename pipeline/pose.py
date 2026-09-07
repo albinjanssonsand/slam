@@ -101,6 +101,26 @@ def decompose_homography(H, camera_matrix):
     return [(R, t.reshape(3, 1)) for R, t in zip(rotations, translations)]
 
 
+def pure_rotation_homography(R, camera_matrix):
+    """
+    The homography a camera rotation alone (zero translation) induces
+    between two views: H = K @ R @ K^-1 - unlike a general planar
+    homography, independent of scene depth or plane geometry entirely, since
+    a pure rotation maps every scene point's ray the same way regardless of
+    its distance from the camera.
+
+    Used to score decompose_homography's rotation hypotheses against each
+    other (mapping._rotation_only_fallback, #36's degenerate-translation
+    tracking fallback) by checking how well each hypothesis's OWN implied
+    zero-translation homography explains the actual observed 2D-2D
+    correspondences (via homography_score) - the candidate whose rotation
+    alone reproduces the motion best is the one to trust, without needing
+    any 3D map or triangulation to disambiguate (both unavailable/
+    meaningless when there's genuinely no translation to triangulate from).
+    """
+    return camera_matrix @ R @ np.linalg.inv(camera_matrix)
+
+
 def decompose_essential(E):
     """
     Recover all 4 motion hypotheses [R1,t], [R1,-t], [R2,t], [R2,-t] from an
