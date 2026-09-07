@@ -2454,3 +2454,130 @@ the table's row added to the `pipeline.mapping` invocation. Gap-check
 (`EVALUATION_METHOD.md` pitfall #1) required before trusting any coverage
 number above 4% on this sequence - rows 6-8 are exactly the pattern that
 pitfall exists to catch.
+
+---
+
+## #49: opportunistic frame-to-frame triangulation - real progress on
+`freiburg1_desk`, not a full fix
+
+**Version:** `issue-49-frame-to-frame-triangulation` branch, on top of
+`main` post-#47 (part 2). Implements
+[#49](https://github.com/albinjanssonsand/slam/issues/49): every mechanism
+#47 (part 2) tested only changed *how* tracking searches its existing map;
+this instead lets the map grow *between* keyframes, not just at them - see
+the issue for the full design rationale and `mapping._opportunistic_
+triangulate_from_frame`'s docstring for the implementation.
+
+**Mechanism:** `--opportunistic-triangulation` (off by default): whenever
+an ordinarily-tracked (non-keyframe) frame's PnP inlier count drops below
+`--kf-min-tracked-points` - the paper's own §V-E condition that blocks
+keyframe promotion, and with it §VI-C's usual new-point search - triangulate
+new map points from that frame's already-accepted pose against the
+reference keyframe (and its covisibility neighbors) anyway, reusing
+`_create_new_points_from_covisible_keyframes` exactly as real keyframe
+insertion does. Only the reference keyframe's side of each new point's
+founding observation is registered (the frame itself isn't a keyframe);
+such a point starts with exactly one observing keyframe and is cleaned up
+automatically by the existing §VI-B culling rules at a later keyframe if it
+never accumulates the normal 3-observing-keyframe minimum - no new
+lifecycle needed.
+
+**Flag-off regression check:** `freiburg1_desk` with the flag omitted is
+byte-identical to part 1's baseline trajectory (diff-confirmed) - the new
+code path is fully gated behind the flag.
+
+**`freiburg1_desk` results, flag on, all combinations tested (gap-checked
+per pitfall #1):**
+
+| Config | Death frame | Keyframes | Gap size | Reconnect | Coverage | ATE/RPE RMSE (m) |
+|---|---|---|---|---|---|---|
+| Baseline (part 1, flag off) | 40 | 4 | permanent (no reconnect) | - | 3.1% | 0.0194 / 0.0430 |
+| `--opportunistic-triangulation` | **55** | 7 | 437 frames | 492 | 72.9% (gapped) | 0.0454 / 0.0828 |
+| `+ --kf-min-tracked-points 20` | 46 | 9 | 449 frames | 495 | 70.5% (gapped) | identical to part 2's row 6 |
+| `+ --relocalize` | **55** | 8 | **421 frames (best)** | 476 | 72.2% (gapped) | 0.0325 / 0.0700 |
+| `+ --rotation-only-fallback` | 55 | 8 | 437 frames | 492 | - | fallback fires 5x post-reconnection only, no effect on the gap itself |
+| `+ --relocalize + --rotation-only-fallback` | 55 | 8 | 421 frames | 476 | - | identical to `+ --relocalize` alone - rotation-only-fallback adds nothing on top |
+
+**Real, meaningful progress - the best death-point extension of anything
+tested across both sessions (+15 frames / +37%, more than double the
+prior best of +6-8 frames from lowering the keyframe threshold alone) -
+but not a full fix.** `--opportunistic-triangulation` alone creates real
+new structure during the decline (26 attempts, 1809 new points on the
+standalone run) and genuinely extends survival, confirmed by the death
+frame moving and by ATE/RPE degrading in the expected direction (a longer
+real trajectory accumulates more real error than one that dies
+immediately - see `EVALUATION_METHOD.md` pitfall #2). `--relocalize`
+stacks on top cleanly (different mechanism, different failure mode) and
+shrinks the remaining blackout by 16 frames (437 -> 421) by finding one
+real match in the richer residual map. `--rotation-only-fallback` does
+NOT stack - it fires successfully several times, but only after the
+reconnection point, contributing nothing to the actual gap (desk's pan has
+real translation throughout, as #47 already established, so there's no
+window of genuine near-pure-rotation for it to catch mid-gap).
+
+**Important negative interaction: `--kf-min-tracked-points 20` and
+`--opportunistic-triangulation` actively conflict, don't combine them.**
+Lowering the keyframe threshold to 20 (equal to `--pnp-min-inliers`'s own
+default) eliminates the "declining but still tracked, blocked from a
+keyframe" window this mechanism exists to exploit - real keyframes now
+claim every frame down to 20 inliers, and once PnP itself fails outright
+at that same floor, there's no accepted pose left to opportunistically
+triangulate from. Confirmed directly: 0 attempts, 0 new points, identical
+output to `--kf-min-tracked-points 20` alone. The wide gap between the
+paper's own default values (`--kf-min-tracked-points` 50, `--pnp-min-
+inliers` 20) is exactly what gives this mechanism room to work - narrowing
+that gap starves it.
+
+**`freiburg1_xyz` regression check:** not byte-identical (fired once, 368
+new points created during a brief dip below 50 inliers) - a small, mixed
+effect: ATE RMSE 0.0702 -> 0.0729 (+3.9%), RPE RMSE 0.0898 -> 0.0756
+(-16%), coverage effectively unchanged (86.5% -> 86.2%), no tracking gaps
+introduced.
+Not a regression worth avoiding, and the flag stays off by default.
+
+**Why this doesn't fully close the gap, and what would - filed as
+follow-up issues rather than pursued here, since both require lifting a
+non-goal:** opportunistic triangulation is still bounded by needing an
+*already-accepted* PnP pose to triangulate from - once inlier count
+actually reaches zero (now at frame 55 instead of 40), there's no pose
+left to bootstrap from, and the pipeline is exactly as stuck as before.
+Discussed with the user directly: the paper's own system likely avoids
+this via two components, both explicit non-goals here -
+
+- A concurrently-running Local Mapping thread that triangulates
+  continuously from every frame rather than gating on discrete keyframe
+  promotion (this issue's own mechanism is a synchronous, partial
+  approximation of exactly that effect, and it measurably helped -
+  corroborating evidence, not just a guess).
+- DBoW2-style appearance-based place recognition, which recognizes a
+  revisited scene by whole-image visual-word similarity rather than
+  literal point correspondence - a fundamentally different, coarser-
+  grained mechanism than anything this pipeline's brute-force Hamming
+  matcher does. Worth flagging a correction to #47 (part 2)'s own
+  "BoW-vs-full-map" test here: that test only restricted the *same*
+  point-level matcher to one keyframe's point subset at a time - it was
+  never a real test of appearance-based image retrieval, so #47's
+  "BoW-style retrieval doesn't help" conclusion deserves less confidence
+  than originally stated.
+
+Filed as [#50](https://github.com/albinjanssonsand/slam/issues/50)
+(lightweight bag-of-words retrieval using `cv2.BOWKMeansTrainer`/
+`BOWImgDescriptorExtractor` - no new dependency) and
+[#51](https://github.com/albinjanssonsand/slam/issues/51) (real
+concurrent Local Mapping thread) for whoever picks this up next - both
+lift an explicit non-goal, which is why this issue doesn't attempt either
+unilaterally.
+
+**Reproduction:**
+
+```bash
+conda activate slam
+python -m pipeline.mapping --video datasets/tum/rgbd_dataset_freiburg1_desk --calibration calibration/tum_freiburg1.yaml --opportunistic-triangulation [--relocalize] [--rotation-only-fallback] --trajectory-output results/<label>_desk_estimate.txt --plot-output results/<label>_desk_trajectory.png --no-display
+
+evo_ape tum datasets/tum/rgbd_dataset_freiburg1_desk/groundtruth.txt results/<label>_desk_estimate.txt -a -s
+evo_rpe tum datasets/tum/rgbd_dataset_freiburg1_desk/groundtruth.txt results/<label>_desk_estimate.txt -a -s
+```
+
+Gap-check (`EVALUATION_METHOD.md` pitfall #1) required, same as part 2 -
+every coverage number above is gapped and none should be read as
+continuous tracking.
