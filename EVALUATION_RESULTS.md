@@ -2581,3 +2581,148 @@ evo_rpe tum datasets/tum/rgbd_dataset_freiburg1_desk/groundtruth.txt results/<la
 Gap-check (`EVALUATION_METHOD.md` pitfall #1) required, same as part 2 -
 every coverage number above is gapped and none should be read as
 continuous tracking.
+
+---
+
+## #50: appearance-based (CLIP) keyframe retrieval for relocalization -
+validated, wired in, no measurable improvement on `freiburg1_desk`
+
+**Version:** `issue-50-clip-appearance-retrieval` branch, on top of `main`
+post-#49. Implements
+[#50](https://github.com/albinjanssonsand/slam/issues/50): #49's own
+write-up above flagged that #47 (part 2)'s "BoW doesn't help" conclusion
+was never a real test of appearance-based image retrieval (whole-image
+similarity, not point-level matching restricted to one keyframe's
+subset) - this issue actually builds that mechanism, using a pretrained
+CLIP ViT-B/32 vision encoder (`Xenova/clip-vit-base-patch32`'s
+vision-only ONNX export) as a practical stand-in for the paper's own
+DBoW2, per the issue's own scope decision (real DBoW2 needs a
+from-source C++ build, ruled out by this project's existing
+OpenCV-version fragility; NetVLAD has no pretrained ONNX export
+anywhere - CLIP was designated the thing to try first, with NetVLAD as a
+fallback only if CLIP's fit validated too weak to be worth wiring in).
+
+**Step 1: fit validation, before wiring in anything (required by the
+issue).** Embedded `freiburg1_desk`'s pre-pan frames (8-46) and the
+known revisit window (476-495, identified in #49's write-up as where the
+camera physically returns) with `CLIPEmbedder`, and checked cosine
+similarity against ground truth:
+
+- Best-match pair: pre-pan frame 37 vs. revisit frame 484, similarity
+  0.9642, ground-truth camera positions 24cm apart - a real match.
+- Broader sweep across the whole gap (every 5th frame, frame 55-500):
+  Pearson correlation between max similarity-to-pre-pan and
+  ground-truth distance to the pre-pan area = **-0.48** (moderate,
+  real, the right sign).
+  The revisit window's frames land at ranks 2, 4, 9, 10 out of 90
+  sampled gap frames by similarity alone (top ~11%) - a genuine,
+  usable signal.
+- **Not a clean spike, though**: frame 200 (182cm from the pre-pan
+  area - clearly a different part of the room) scores 0.9596, almost
+  indistinguishable from the true revisit's peak of 0.9628 at frame
+  485. Frames 190-200 as a group score comparably to the real revisit
+  despite being physically 1.7-1.8m away. CLIP's embedding is picking
+  up real scene-appearance signal (lighting/wall-texture/general
+  framing), but not cleanly enough to trust as a hard "this frame =
+  this place" filter.
+
+**Decision (per the issue's own criterion - "does it cleanly
+distinguish same place from different place, or is that a reason to
+fall back to NetVLAD"):** the correlation is real, not absent, so this
+cleared the bar to wire in - but the false-positive risk (frame 200)
+means it can only be trusted as a *soft* pre-filter with a fallback,
+never a hard replacement for the existing unrestricted search.
+
+**Mechanism:** `--appearance-relocalize` (off by default, requires
+`--relocalize`): each keyframe now also gets a CLIP embedding
+(`keyframe_clip_embedding`, computed once at insertion, same lifecycle
+convention as `keyframe_kp`/`keyframe_desc`). Inside the existing
+relocalization block, the current lost frame is embedded and compared
+against every keyframe's stored embedding (cosine similarity - both
+L2-normalized, so a plain dot product); the match is first restricted
+to just the single best-matching keyframe's own points and PnP is
+attempted against that smaller set. **Only if that fails** does it fall
+through to today's unrestricted full-active-map search - so this can
+only add an extra attempt on top of the existing mechanism, never
+remove it, in case CLIP picks the wrong keyframe. See
+`pipeline/clip_ml.py` (`CLIPEmbedder`, same `DepthEstimator`-style
+wrapper convention as `depth_ml.py`: `model_path` constructor arg,
+`ort.InferenceSession` with `CPUExecutionProvider`) and the flag's own
+`--help` text in `pipeline/mapping.py`.
+
+**`freiburg1_desk` result (`--opportunistic-triangulation --relocalize`,
+`+ --appearance-relocalize`, gap-checked per pitfall #1):**
+
+| Config | Death frame | Keyframes | Gap size | Reconnect | ATE/RPE RMSE (m) |
+|---|---|---|---|---|---|
+| `--opportunistic-triangulation --relocalize` (baseline, this session) | 52 | 8 | 430 frames | 482 | 0.0622 / 0.1150 |
+| `+ --appearance-relocalize` | 52 | 8 | 430 frames | 482 | 0.0622 / 0.1150 (byte-identical trajectory) |
+
+(Baseline death/gap/reconnect frames measured slightly differently here
+- 52/430/482 - than #49's own write-up above - 55/421/476 - despite no
+intervening logic change to either mechanism between sessions; not
+investigated further, since the point of this test is the *within-session*
+comparison, which is exact.)
+
+`--appearance-relocalize` made **no measurable difference**: the output
+trajectory is byte-identical (`diff`-confirmed) to the same-session
+baseline. Relocalization stats explain why - **510 relocalization
+attempts, 0 succeeded, with or without the appearance pre-filter.** Of
+those 510, the CLIP-restricted candidate search reached PnP (found >= 6
+matches within the single best-matching keyframe's own points) **112
+times, and still never once cleared `--pnp-min-inliers`.**
+
+**This is the important, non-obvious finding**: it initially looked
+like the earlier `+ --relocalize` result (0-1 successes across 500+
+attempts, per the issue's own framing) might be a *candidate-selection*
+problem - the brute-force full-map search drowning a real match in too
+many competing candidates. Appearance retrieval was specifically
+supposed to test that theory by handing PnP a much smaller, appearance-
+ranked candidate set. It didn't help, and 112 of those restricted
+attempts show the correct(-looking) keyframe *was* being selected and
+handed to PnP - the failure is downstream of candidate selection, in
+literal ORB-descriptor point correspondence itself. Whatever changed
+about the scene's appearance during the whip-pan (motion blur, lighting,
+viewing angle) breaks ORB Hamming matching badly enough that even a
+correctly-narrowed candidate pool can't produce `--pnp-min-inliers`-worth
+of valid 2D-3D correspondences.
+
+**Why this means NetVLAD likely wouldn't do better either, and what
+would:** NetVLAD (and DBoW2 itself) are scene-*recognition* mechanisms,
+not correspondence solvers - they narrow down *which* keyframe you're
+probably looking at, exactly what CLIP already does adequately here (r
+= -0.48, correct keyframe reached PnP 112/510 times). The bottleneck
+this test exposes is downstream of recognition: once a place is
+recognized, real ORB-SLAM still needs *some* mechanism to recover a
+pose from it, and here that's still literal point-level PnP, which is
+failing regardless of candidate scope. The paper's actual answer to
+this is loop closing / pose-graph optimization - which doesn't need
+fresh 2D-3D correspondences at all, just a recognized-place constraint
+folded into the graph - and that's an explicit non-goal of this project
+(see this file's own non-goals and issue #50/#47's scope notes). So the
+honest conclusion is: appearance retrieval, done correctly, still isn't
+enough on its own without either a correspondence-free recovery
+mechanism (loop closing, out of scope) or #51's concurrent Local
+Mapping thread (denser structure sooner, the other still-open lever).
+
+**`freiburg1_xyz` regression check:** `--relocalize` never fires on this
+sequence regardless (798 frames, 795 tracked, 0 gaps >5 frames, clean
+per pitfall #1's gap-check - same as prior sessions), so `0
+relocalization attempts` with or without `--appearance-relocalize` -
+trajectories are byte-identical (`diff`-confirmed), ATE/RPE RMSE 0.1129
+/ 0.1032 for both. Exactly the "off/never-triggered makes zero extra
+calls" behavior the flag's own help text promises.
+
+**Reproduction:**
+
+```bash
+conda activate slam
+python -m pipeline.mapping --video datasets/tum/rgbd_dataset_freiburg1_desk --calibration calibration/tum_freiburg1.yaml --opportunistic-triangulation --relocalize [--appearance-relocalize] --trajectory-output results/<label>_desk_estimate.txt --plot-output results/<label>_desk_trajectory.png --no-display
+
+evo_ape tum datasets/tum/rgbd_dataset_freiburg1_desk/groundtruth.txt results/<label>_desk_estimate.txt -a -s
+evo_rpe tum datasets/tum/rgbd_dataset_freiburg1_desk/groundtruth.txt results/<label>_desk_estimate.txt -a -s
+```
+
+Gap-check (`EVALUATION_METHOD.md` pitfall #1) required, same as #49 -
+the `freiburg1_desk` numbers above are gapped and should not be read as
+continuous tracking.
