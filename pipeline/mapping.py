@@ -1664,10 +1664,29 @@ def _demo():
                               "an earlier version of this pipeline also required this here, "
                               "but measured worse on every metric; see EVALUATION_RESULTS.md) "
                               "or whether a pose is estimated at all once tracking a map (px)")
-    parser.add_argument("--kf-min-tracked-points", type=int, default=50,
+    parser.add_argument("--kf-min-tracked-points", type=int, default=20,
                          help="Paper §V-E condition: minimum PnP-tracked map "
                               "points a frame must have before it can be promoted to a "
-                              "keyframe")
+                              "keyframe. Paper's own figure is 50; lowered here to match "
+                              "--pnp-min-inliers's own floor (20), so this condition is "
+                              "satisfied by construction whenever a frame's pose is accepted "
+                              "at all, rather than an independent, stricter bar. Measured "
+                              "necessary (not just harmless) on freiburg1_desk: at 50, a "
+                              "declining-but-still-tracked stretch during a real ~35deg/0.57s "
+                              "handheld whip-pan (ground-truth confirmed, ~3x the rate of the "
+                              "immediately preceding healthy segment) blocks every keyframe "
+                              "for ~17 straight frames while overlap with the confirmed map is "
+                              "being consumed - by the time inliers recover enough to clear "
+                              "50, there is nothing left in view to recover with (verified: "
+                              "brute-force full-map relocalization AND every individual "
+                              "keyframe's own point subset both hit zero matches at the same "
+                              "frame). At 20, keyframes keep being inserted throughout the "
+                              "pan instead, and coverage on freiburg1_desk goes from 4.6% to "
+                              "70.1% (see EVALUATION_RESULTS.md). Confirmed a no-op on "
+                              "freiburg1_xyz (already-healthy tracking rarely drops anywhere "
+                              "near even 50, so the lower floor is never the binding "
+                              "condition there): keyframe count/coverage/ATE/RPE all within "
+                              "noise of the old default")
     parser.add_argument("--kf-ref-ratio", type=float, default=0.9,
                          help="Paper §V-E condition: promote a frame to a keyframe only "
                               "if it tracks fewer than this fraction of the map points "
@@ -1680,12 +1699,22 @@ def _demo():
                               "this many frames after the last global relocalization - "
                               "always satisfied today, since relocalization (#13) doesn't "
                               "exist yet in this pipeline")
-    parser.add_argument("--kf-max-frames-since-keyframe", type=int, default=20,
+    parser.add_argument("--kf-max-frames-since-keyframe", type=int, default=8,
                          help="Force a keyframe insertion (bypassing every other §V-E "
                               "condition) after this many frames with none accepted - "
                               "stands in for the paper's "
                               "'local mapping idle' condition, which has no meaning here "
-                              "since there's no separate mapping thread")
+                              "since there's no separate mapping thread. Lowered from 20: on "
+                              "its own this made little difference on freiburg1_desk's "
+                              "whip-pan death spiral (PnP itself starts rejecting frames via "
+                              "--pnp-min-inliers before 20 - or even 8 - frames can elapse), "
+                              "but combined with the --kf-min-tracked-points 20 change it "
+                              "pushed desk's coverage further (70.1% -> 73.8%) and measurably "
+                              "improved freiburg1_xyz too (ATE RMSE 0.113m -> 0.069m, RPE "
+                              "0.103m -> 0.048m, ~40 percent more keyframes) - more frequent "
+                              "forced keyframes apparently give local BA more frequent "
+                              "correction opportunities even on easy motion. See "
+                              "EVALUATION_RESULTS.md")
     parser.add_argument("--guided-window", type=float, default=60.0,
                          help="Pixel radius around each map point's motion-"
                               "predicted projection to search for a descriptor match "
