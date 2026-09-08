@@ -2726,3 +2726,150 @@ evo_rpe tum datasets/tum/rgbd_dataset_freiburg1_desk/groundtruth.txt results/<la
 Gap-check (`EVALUATION_METHOD.md` pitfall #1) required, same as #49 -
 the `freiburg1_desk` numbers above are gapped and should not be read as
 continuous tracking.
+
+## #55: loop closing (Sim(3) geometric verification + Essential Graph
+pose-graph optimization) - the mechanism works and doesn't regress
+`freiburg1_xyz`, but does not close `freiburg1_desk`'s gap
+
+**Version:** `issue-55-loop-closing` branch, on top of `main` post-#50.
+Implements [#55](https://github.com/albinjanssonsand/slam/issues/55):
+#50's own write-up above concluded the whip-pan gap's bottleneck is
+downstream of candidate recognition, in literal point correspondence
+itself, and that the paper's actual answer is loop closing (§VII) -
+recognition + geometric verification + a pose-graph correction that
+doesn't need fresh 2D-3D correspondence to succeed the way ordinary PnP
+does. This issue lifts the "no loop closing/Essential Graph/pose-graph
+optimization" non-goal (per direct maintainer approval - see the issue)
+and builds it: `--loop-closing` (off by default, independent of
+`--relocalize`/`--appearance-relocalize`) runs on every new keyframe -
+CLIP-based candidate detection (reusing #50's `CLIPEmbedder`/
+`keyframe_clip_embedding`, gated separately from `--appearance-
+relocalize` now), Sim(3) geometric verification (3D-3D descriptor
+matching between the two keyframes' own observed map points, RANSAC-
+fit via Umeyama's closed-form similarity transform, scored by
+reprojection error - looser bar than ordinary PnP, see `--loop-min-
+inliers`/`--loop-reproj-threshold-px`), and, if verified, an Essential
+Graph Sim(3) pose-graph optimization (`pipeline/loop_closing.py`,
+`scipy.optimize.least_squares` over the map's own covisibility graph
+plus every verified loop edge - see `Map.essential_graph_covisibility_
+edges`/`Map.loop_edges`) that corrects both keyframe poses and map
+points, with a full-BA cleanup pass afterward. A correction is rolled
+back if it makes the map's own mean reprojection error worse rather
+than better (`--loop-reject-worse-by`) - a direct, cheap defense
+against accepting a wrong place with high confidence. See
+`pipeline/loop_closing.py`'s module docstring and `--loop-closing`'s own
+`--help` text (plus its ~9 supporting `--loop-*` flags) for the full
+design/rationale, including why this needs Sim(3) rather than SE(3):
+this pipeline's single, continuously-extended map has one arbitrary
+scale fixed at bootstrap, but nothing keeps a keyframe long after a
+tracking-loss gap at exactly that same effective scale as one from
+before it (paper §VII-B).
+
+**`freiburg1_desk` result (`--opportunistic-triangulation --relocalize`,
+`+ --loop-closing`, gap-checked per pitfall #1):**
+
+| Config | Death frame | Keyframes | Gap size | Reconnect | ATE/RPE RMSE (m) |
+|---|---|---|---|---|---|
+| `--opportunistic-triangulation --relocalize` (baseline, this session) | 55 | 8 | 421 frames | 476 | 0.0325 / 0.0700 |
+| `+ --loop-closing` (default thresholds) | 55 | 8 | 421 frames | 476 | 0.0325 / 0.0700 (byte-identical trajectory) |
+
+`--loop-closing` made **no difference at all with default settings**,
+for a structural reason, not a tuning one: `--loop-min-keyframe-gap`
+defaults to 30 (a revisit only counts once enough of the map has been
+built since to not just be a temporal neighbor), but this session's
+`freiburg1_desk` baseline - like #50's own session before it (8
+keyframes there too) - never produces more than **8 keyframes total**
+across the whole 616-frame sequence. With a keyframe count below the
+gap threshold, `_detect_loop_candidate` can never find a single
+qualifying candidate (`0 candidates detected` in the run log) - the
+default gap, sized for a paper-scale map, is simply larger than this
+sequence's own realistic keyframe count under this flag stack.
+
+**Diagnostic follow-up (not the default configuration - loosened
+specifically to see whether the mechanism itself could do anything
+here, given the structural block above):** re-ran with `--loop-min-
+keyframe-gap 3 --loop-clip-threshold 0.6`, then again with `--loop-min-
+matches 6 --loop-min-inliers 4 --loop-reproj-threshold-px 15` on top
+(vs. defaults 12/8/8px) to see whether the bottleneck was verification
+strictness specifically:
+
+- Both loosened runs found the **same candidate every time: keyframe 4
+  (pre-pan, similarity 0.92)** - CLIP recognition is working correctly
+  here too, consistent with #50's own r=-0.48 finding, and the
+  similarity is well above default `--loop-clip-threshold` (0.75).
+- Geometric verification **still failed both times**, even after
+  substantially loosening the minimum-matches/minimum-inliers/
+  reprojection-error bars. Whatever correspondence exists between
+  keyframe 4's own observed map points and the post-gap keyframe's own
+  observed map points doesn't reach even a heavily loosened bar.
+
+**This is the honest, load-bearing finding**: the same fundamental
+problem #50 diagnosed for single-FRAME-vs-keyframe PnP correspondence
+during this whip-pan (motion blur/lighting/viewing-angle change
+breaking literal ORB matching) also breaks keyframe-vs-keyframe 3D-3D
+correspondence, which is what Sim(3) verification depends on instead of
+PnP. Loosening the geometric bar - exactly the design lever this issue
+proposed - does not help, because the actual constraint is upstream of
+any bar: too few (or zero) literal descriptor matches between the two
+point sets survive the ratio test at all, not that RANSAC can't clear
+whatever inlier count is required among a healthy set of matches.
+Recognizing the right place (CLIP, working correctly) and then folding
+a recognized-place constraint into a pose graph (built and validated
+below) doesn't help if geometric verification itself has no
+correspondence to build a constraint FROM. **#51's concurrent Local
+Mapping thread remains the other still-open lever** per the issue's own
+framing - denser structure sooner might leave more distinctive/
+redundant points behind for a future revisit to match against, though
+nothing measured here confirms that either.
+
+**`freiburg1_xyz` regression check (required by the issue, gap-checked
+per pitfall #1 - both runs: 0 gaps > 5 frames, near-full coverage):**
+
+| Config | Keyframes | ATE mean/RMSE (m) | RPE mean/RMSE (m) | Candidates / verified / closed |
+|---|---|---|---|---|
+| default (baseline, this session) | 85 | 0.0617 / 0.0702 | 0.0705 / 0.0898 | - |
+| `+ --loop-closing` (default thresholds) | 87 | 0.0582 / 0.0683 | 0.0658 / 0.0866 | 36 / 5 / 5 |
+
+No regression - if anything, a small improvement on both ATE and RPE
+(within the RNG-noise range EVALUATION_METHOD.md pitfall #3 describes,
+so not claimed as a real gain). The candidate breakdown is the more
+informative number: `freiburg1_xyz`'s small back-and-forth translation
+naturally produces many visually-similar-but-not-covisible keyframe
+pairs (36 candidates, similarity 0.82-0.95) that are exactly the kind
+of thing a loosened geometric-verification bar risks accepting as false
+positives - **31 of 36 were correctly rejected by Sim(3) verification**,
+and all 5 that passed verification also passed the mean-reprojection-
+error rollback check (none were later undone). No false positive
+(a wrong place confidently accepted) was observed on this sequence.
+
+**Self-review found and fixed 5 real bugs** before this was considered
+done (see the branch's own commit/PR for specifics): `--loop-closing`
+alone (without `--appearance-relocalize`) was silently activating
+relocalization's own CLIP-restricted candidate pre-filter; the post-
+correction cleanup BA was passing an empty `recent_step_sizes`,
+disabling its own translation-plausibility check instead of using the
+same loosened-but-active check `--global-ba-at-end` already established
+as this codebase's convention for a whole-trajectory correction; the
+cleanup BA's own outlier-discard/point-cull counts were silently
+dropped from the run-wide totals; and `recent_step_sizes` wasn't
+cleared after an accepted (scale-changing) correction, unlike
+relocalization's own precedent for a comparable pose "jump". Two
+findings were accepted as known, documented limitations rather than
+fixed: a corrected point's `viewing_direction`/`d_min`/`d_max` go stale
+after a Sim(3) correction (the same limitation ordinary BA already has
+for its own point updates, just larger here since Sim(3) can rescale),
+and the Sim(3) RANSAC has no seed/reproducibility flag (consistent with
+every other RANSAC call in this codebase being unseeded).
+
+**Reproduction:**
+
+```bash
+conda activate slam
+python -m pipeline.mapping --video datasets/tum/rgbd_dataset_freiburg1_desk --calibration calibration/tum_freiburg1.yaml --opportunistic-triangulation --relocalize [--loop-closing] --trajectory-output results/<label>_desk_estimate.txt --plot-output results/<label>_desk_trajectory.png --no-display
+
+evo_ape tum datasets/tum/rgbd_dataset_freiburg1_desk/groundtruth.txt results/<label>_desk_estimate.txt -a -s
+evo_rpe tum datasets/tum/rgbd_dataset_freiburg1_desk/groundtruth.txt results/<label>_desk_estimate.txt -a -s
+```
+
+Gap-check (`EVALUATION_METHOD.md` pitfall #1) required for `freiburg1_desk` -
+the numbers above are gapped and should not be read as continuous tracking.

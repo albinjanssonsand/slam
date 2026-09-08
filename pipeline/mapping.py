@@ -114,8 +114,10 @@ class Map:
         self._observations = []
         self._point_keyframes = []
 
-        # Covisibility graph (§III-D, plain covisibility only - no Essential
-        # Graph/spanning tree/loop-closure edges): kf_idx -> {other_kf_idx:
+        # Covisibility graph (§III-D, plain covisibility only - no spanning
+        # tree; the Essential Graph's loop-closure edges are the separate
+        # _loop_edges list below, see essential_graph_covisibility_edges for
+        # the sparser covisibility-derived half): kf_idx -> {other_kf_idx:
         # shared_point_count}, symmetric, incrementally updated by
         # add_observation (each point newly shared between two keyframes
         # bumps their edge weight by exactly one - never a full recompute).
@@ -125,6 +127,21 @@ class Map:
         self._covisibility = {}
         self._keyframe_points = {}
         self.covisibility_min_shared = covisibility_min_shared
+
+        # §VII-B Essential Graph loop-closure edges (#55): verified Sim(3)
+        # constraints between two non-covisible keyframes recognized (via
+        # appearance - see mapping._detect_loop_candidate) as observing the
+        # same physical place. Kept permanently, unlike the covisibility
+        # graph's own edges above (which add_observation derives incrementally
+        # from ordinary tracking) - a loop is by definition a connection
+        # ordinary keyframe insertion can never rediscover on its own. Each
+        # entry is (kf_i, kf_j, s_ij, R_ij, t_ij): the Sim(3) transform from
+        # kf_i's camera frame to kf_j's, established at verification time
+        # (mapping._verify_loop_closure) - a pose-graph optimization run
+        # later (mapping._apply_loop_correction) includes every edge here,
+        # not just the one that just triggered it, so an earlier loop
+        # closure's own correction stays enforced by later ones too.
+        self._loop_edges = []
 
         # kf_idx -> set of that keyframe's own ORB feature indices already
         # tied to a map point (across every observation ever registered for
@@ -433,6 +450,48 @@ class Map:
         threshold = self.covisibility_min_shared if min_shared is None else min_shared
         edges = self._covisibility.get(kf_idx, {})
         return {k: w for k, w in edges.items() if w >= threshold}
+
+    def essential_graph_covisibility_edges(self, min_shared):
+        """
+        §VII-B Essential Graph (#55): the plain covisibility graph's own
+        edges (§III-D), restricted to weight >= min_shared - a much higher
+        bar than covisible_keyframes' own covisibility_min_shared default,
+        since the Essential Graph is meant to be a SPARSER subgraph kept
+        small enough for a whole-trajectory pose-graph optimization
+        (mapping._apply_loop_correction) to stay cheap, not every
+        covisibility edge. Returns a list of (kf_i, kf_j, weight) with
+        kf_i < kf_j (deduplicated - the underlying graph is symmetric).
+        """
+        seen = set()
+        edges = []
+        for kf_i, neighbors in self._covisibility.items():
+            for kf_j, weight in neighbors.items():
+                if weight < min_shared:
+                    continue
+                key = (min(kf_i, kf_j), max(kf_i, kf_j))
+                if key in seen:
+                    continue
+                seen.add(key)
+                edges.append((key[0], key[1], weight))
+        return edges
+
+    def add_loop_edge(self, kf_i, kf_j, s_ij, R_ij, t_ij):
+        """Record a verified §VII-B loop-closure Sim(3) constraint (kf_i's
+        camera frame -> kf_j's) - see _loop_edges' own docstring above."""
+        self._loop_edges.append((kf_i, kf_j, s_ij, R_ij, t_ij))
+
+    @property
+    def loop_edges(self):
+        """Every loop-closure edge ever verified, in the order they were
+        added - see _loop_edges' own docstring above."""
+        return list(self._loop_edges)
+
+    def discard_loop_edges_since(self, n):
+        """Rollback support (#55): drop every loop edge added after the
+        first n - used when a speculatively-applied loop closure is
+        rejected as having made the map's overall reprojection error worse
+        (see mapping._run_loop_closing)."""
+        del self._loop_edges[n:]
 
     def keyframe_points(self, kf_idx):
         """Map point indices observed by this keyframe."""
@@ -1790,6 +1849,314 @@ def _extend_new_points_to_other_covisible_keyframes(
     return n_extra
 
 
+def _detect_loop_candidate(sparse_map, keyframe_clip_embedding, kf_new, embedding,
+                            min_similarity, min_keyframe_gap):
+    """
+    §VII Loop Detection (#55): the highest-CLIP-similarity earlier keyframe
+    that (a) isn't covisible with kf_new at all (min_shared=1 - the paper
+    excludes keyframes covisible with the current one from candidacy, since
+    those already share structure through ordinary tracking/covisibility -
+    ordinary local overlap, not a "loop" by the paper's own definition) and
+    (b) is at least min_keyframe_gap keyframes older (a revisit only means
+    something once enough of the map has been built since to not just be
+    neighbors in an otherwise-continuous pass over the same area). Reuses
+    the same CLIP embeddings/similarity metric --appearance-relocalize
+    already validated for place recognition (#50) - see
+    keyframe_clip_embedding's own docstring in _demo.
+
+    Returns (candidate_kf_idx, similarity) or (None, None) if nothing active
+    and non-covisible clears min_similarity.
+    """
+    covisible = set(sparse_map.covisible_keyframes(kf_new, min_shared=1))
+    best_kf, best_sim = None, min_similarity
+    for kf_i in range(kf_new):
+        if (
+            keyframe_clip_embedding[kf_i] is None
+            or not sparse_map.keyframe_active(kf_i)
+            or kf_i in covisible
+            or kf_new - kf_i < min_keyframe_gap
+        ):
+            continue
+        sim = float(keyframe_clip_embedding[kf_i] @ embedding)
+        if sim > best_sim:
+            best_kf, best_sim = kf_i, sim
+    return (best_kf, best_sim) if best_kf is not None else (None, None)
+
+
+def _verify_loop_closure(sparse_map, keyframe_poses, keyframe_observations,
+                          kf_cand, kf_new, camera_matrix, ratio,
+                          min_matches, min_inliers, reproj_threshold_px,
+                          max_ransac_iterations, max_scale_drift):
+    """
+    §VII-B Geometric Verification (#55), loosened vs. the ordinary PnP bar
+    by design (see mapping.py's --loop-min-inliers/--loop-reproj-threshold-px
+    --help): match kf_cand's and kf_new's OWN observed map-point descriptors
+    directly against each other - 3D-3D correspondence, not 2D-3D PnP, since
+    both keyframes already have real triangulated points and literal
+    per-FRAME point matching against a keyframe is exactly what #50 showed
+    fails here - then RANSAC-fit a Sim(3) (pipeline.loop_closing.
+    estimate_sim3_ransac) rather than plain PnP's SE(3), since the two
+    keyframes' own local structure can have drifted apart in effective scale
+    as well as pose by the time a loop is recognized (see mapping.py's
+    --loop-closing --help and pipeline/loop_closing.py's own module
+    docstring for why).
+
+    Returns (s, R, t, n_inliers, n_matches) - the Sim(3) mapping kf_cand's
+    matched points onto kf_new's - or None if verification fails at any
+    stage (too few candidate points/matches, RANSAC never reaches
+    min_inliers, or the fitted scale falls outside
+    [1/max_scale_drift, max_scale_drift] - a sanity bound against accepting
+    an implausible scale jump as a "verified" loop, see
+    --loop-max-scale-drift's own --help).
+    """
+    from pipeline.features import match_descriptors
+    from pipeline.loop_closing import estimate_sim3_ransac
+
+    cand_ids = np.array(sorted(p for p in sparse_map.keyframe_points(kf_cand) if sparse_map.active[p]))
+    new_ids = np.array(sorted(p for p in sparse_map.keyframe_points(kf_new) if sparse_map.active[p]))
+    if len(cand_ids) < min_matches or len(new_ids) < min_matches:
+        return None
+
+    matches = match_descriptors(sparse_map.descriptors[cand_ids], sparse_map.descriptors[new_ids], ratio)
+    if len(matches) < min_matches:
+        return None
+
+    src_ids = cand_ids[[m.queryIdx for m in matches]]
+    dst_ids = new_ids[[m.trainIdx for m in matches]]
+
+    dst_pixel_by_point = {pid: (x, y) for pid, x, y in keyframe_observations[kf_new]}
+    keep = [i for i, pid in enumerate(dst_ids) if pid in dst_pixel_by_point]
+    if len(keep) < min_matches:
+        return None
+    src_points = sparse_map.points[src_ids[keep]]
+    dst_points = sparse_map.points[dst_ids[keep]]
+    dst_pixels = np.float32([dst_pixel_by_point[dst_ids[i]] for i in keep])
+
+    R_new, t_new, _ = keyframe_poses[kf_new]
+    result = estimate_sim3_ransac(
+        src_points, dst_points, dst_pixels, R_new, t_new, camera_matrix,
+        reproj_threshold_px=reproj_threshold_px, min_inliers=min_inliers,
+        max_iterations=max_ransac_iterations,
+    )
+    if result is None:
+        return None
+    s, R, t, inlier_mask = result
+    if not (1.0 / max_scale_drift <= s <= max_scale_drift):
+        return None
+    return s, R, t, int(inlier_mask.sum()), len(matches)
+
+
+def _apply_loop_correction(sparse_map, keyframe_poses, kf_cand, kf_new, s_geo, R_geo, t_geo,
+                            essential_min_shared):
+    """
+    §VII-B (#55): record the newly verified loop edge on the map, then
+    re-optimize every active keyframe's Sim(3) pose over the Essential Graph
+    (sequential + strong-covisibility + every loop edge ever verified - see
+    Map.essential_graph_covisibility_edges/Map.loop_edges) and fold the
+    result back into keyframe_poses/sparse_map.points.
+
+    The loop edge's own measurement (kf_cand's camera frame -> kf_new's) is
+    the geometric verification's world-to-world Sim(3) alignment (s_geo,
+    R_geo, t_geo: maps kf_cand's matched points onto kf_new's), composed
+    with both keyframes' CURRENT (pre-correction, s=1) poses:
+    S_cur_old ∘ W ∘ S_cand_old^-1, i.e. "go from kf_cand's camera frame to
+    world (via its own current pose), realign that world point via the
+    geometric verification's own discovered discrepancy, then project into
+    kf_new's camera frame (via ITS current pose)" - see
+    pipeline/loop_closing.py's own module docstring for the Sim(3)
+    convention/composition rules this uses.
+
+    Every other keyframe pair's edge measurement is instead read directly
+    off their OWN current poses (preserving local rigidity) - only the loop
+    edge carries genuinely new information, which the graph then has to
+    distribute across every keyframe between kf_cand and kf_new to resolve.
+    Sequential (kf_i, kf_i+1) edges stand in for the paper's own spanning
+    tree (built by an always-live Local Mapping thread this pipeline
+    doesn't have - #51's separate, not-yet-built scope) - they guarantee
+    the graph stays connected even where covisibility is sparse, which is
+    usually exactly true right across the tracking-loss gap a loop closure
+    is fixing in the first place.
+
+    Each active map point is corrected via its own creation keyframe's
+    OLD -> NEW Sim(3) (falling back to any other still-active observing
+    keyframe if the creation keyframe was itself since culled - see
+    Map.keyframe_active's docstring for why that can happen; a point left
+    with no active observing keyframe at all - which shouldn't be reachable,
+    since it would already have been removed by cull_low_observation_points
+    - is skipped rather than crashing).
+
+    A known, accepted limitation shared with ordinary bundle adjustment
+    (_apply_ba_result also writes sparse_map.points directly): moving a
+    point here does NOT recompute its §III-C viewing_direction/d_min/d_max
+    (Map._recompute_point_metadata) or update its observations' own stored
+    camera centers, both of which are derived from the PRE-correction
+    geometry and would need the (never separately tracked) per-observation
+    keyframe pose at observation time to redo properly. BA already accepts
+    this same staleness for its own (SE(3)-only, typically small) pose
+    corrections; a Sim(3) loop correction can rescale a point's neighborhood
+    by up to --loop-max-scale-drift, so the resulting scale-invariance-bound
+    staleness can be larger here - a real, honest cost of this design, not
+    assumed away. A later keyframe's own fresh observation of the same
+    point (add_observation) immediately fixes its d_min/d_max (keyed off
+    only the most recent observation - see _recompute_point_metadata) using
+    consistent, post-correction geometry, though viewing_direction stays a
+    mix of old and new observation rays until enough fresh ones accumulate
+    to dominate the mean.
+    """
+    from pipeline.loop_closing import optimize_essential_graph, sim3_compose, sim3_inverse
+
+    active_kfs = sorted(k for k in range(len(keyframe_poses)) if sparse_map.keyframe_active(k))
+    active_set = set(active_kfs)
+    old_sim3 = {k: (1.0, keyframe_poses[k].R, keyframe_poses[k].t) for k in active_kfs}
+
+    cand_inv = sim3_inverse(old_sim3[kf_cand])
+    world_align = (s_geo, R_geo, t_geo)
+    loop_edge = sim3_compose(sim3_compose(cand_inv, world_align), old_sim3[kf_new])
+    sparse_map.add_loop_edge(kf_cand, kf_new, *loop_edge)
+
+    def _measured(i, j):
+        return sim3_compose(sim3_inverse(old_sim3[i]), old_sim3[j])
+
+    sequential_pairs = set(zip(active_kfs, active_kfs[1:]))
+    edges = [(i, j, *_measured(i, j)) for i, j in sequential_pairs]
+    for i, j, _weight in sparse_map.essential_graph_covisibility_edges(essential_min_shared):
+        if i in active_set and j in active_set and (i, j) not in sequential_pairs:
+            edges.append((i, j, *_measured(i, j)))
+    for kf_i, kf_j, s_ij, R_ij, t_ij in sparse_map.loop_edges:
+        if kf_i in active_set and kf_j in active_set:
+            edges.append((kf_i, kf_j, s_ij, R_ij, t_ij))
+
+    # Inactive (culled) keyframes fall back to their own real last-known
+    # pose rather than an arbitrary identity default - never actually read
+    # by the optimization itself (no edge ever references an inactive
+    # keyframe - see the edge-building loops above), but keeping it
+    # correct avoids a latent trap for any future caller that does.
+    initial_poses = [
+        old_sim3.get(k, (1.0, keyframe_poses[k].R, keyframe_poses[k].t))
+        for k in range(len(keyframe_poses))
+    ]
+    optimized = optimize_essential_graph(
+        len(keyframe_poses), initial_poses, edges, fixed_keyframes=[0],
+    )
+
+    for p in np.where(sparse_map.active)[0]:
+        ref = int(sparse_map.created_kf[p])
+        if ref not in active_set:
+            candidates = sparse_map.observing_keyframes(p) & active_set
+            if not candidates:
+                continue
+            ref = min(candidates)
+        corrected = sim3_compose(old_sim3[ref], sim3_inverse(optimized[ref]))
+        s_c, R_c, t_c = corrected
+        sparse_map.points[p] = (s_c * (R_c @ sparse_map.points[p]) + t_c.ravel())
+
+    for k in active_kfs:
+        s_k, R_k, t_k = optimized[k]
+        keyframe_poses[k] = keyframe_poses[k]._replace(R=R_k, t=t_k / s_k)
+
+
+def _run_loop_closing(sparse_map, keyframe_poses, keyframe_observations, keyframe_clip_embedding,
+                       new_kf_idx, embedding, camera_matrix, recent_step_sizes, args):
+    """
+    §VII Loop Closing (#55), called once per new keyframe when
+    --loop-closing is set: detect (CLIP appearance, _detect_loop_candidate),
+    verify (Sim(3) RANSAC, _verify_loop_closure), and correct (Essential
+    Graph Sim(3) pose-graph optimization, _apply_loop_correction) a revisit
+    of an earlier, non-covisible part of the map.
+
+    Applies the correction speculatively, then rolls it back (restoring
+    keyframe_poses/sparse_map.points and dropping the just-added loop edge)
+    if the whole map's mean reprojection error got WORSE rather than better
+    by more than --loop-reject-worse-by - a direct, cheap defense against
+    exactly the false-positive risk the issue's own design (a deliberately
+    loosened geometric-verification bar) trades for: a wrong place accepted
+    with high confidence should make the map LESS self-consistent overall,
+    not more, so this catches it without needing a second independent
+    check. Runs one cleanup full BA pass (reusing _run_global_ba, same as
+    the paper's own post-loop-closure full BA) once a correction is kept,
+    to resolve the residual per-observation inconsistency the pose-graph
+    optimization alone only approximately corrects for non-reference-
+    keyframe observations (see _apply_loop_correction's own docstring).
+    That cleanup pass's own plausibility check is given the REAL
+    recent_step_sizes (not an empty list) alongside the already-looser
+    --global-ba-max-step-ratio, matching --global-ba-at-end's own call site
+    exactly (see _validate_and_apply_ba's docstring for why a whole-
+    trajectory correction needs the loosened ratio, not a disabled check).
+
+    recent_step_sizes is never mutated here even when a correction is kept
+    (only the caller clears it, same as relocalization's own
+    recent_step_sizes.clear() after a comparable "jump") - see _demo's own
+    call sites.
+
+    Returns a dict describing the outcome for the caller to report/log
+    (including n_ba_outliers/n_ba_culled from the cleanup BA pass, for the
+    caller to fold into its own run-wide BA-outlier totals same as every
+    other BA call site), or None if no candidate cleared the CLIP
+    similarity threshold at all.
+    """
+    candidate_kf, similarity = _detect_loop_candidate(
+        sparse_map, keyframe_clip_embedding, new_kf_idx, embedding,
+        args.loop_clip_threshold, args.loop_min_keyframe_gap,
+    )
+    if candidate_kf is None:
+        return None
+
+    verification = _verify_loop_closure(
+        sparse_map, keyframe_poses, keyframe_observations, candidate_kf, new_kf_idx,
+        camera_matrix, args.ratio, args.loop_min_matches, args.loop_min_inliers,
+        args.loop_reproj_threshold_px, args.loop_ransac_iterations, args.loop_max_scale_drift,
+    )
+    if verification is None:
+        return {"candidate": candidate_kf, "similarity": similarity, "verified": False,
+                "accepted": False, "n_matches": None, "n_inliers": None,
+                "n_ba_outliers": 0, "n_ba_culled": 0}
+    s_geo, R_geo, t_geo, n_inliers, n_matches = verification
+
+    before_stats = _reprojection_error_stats(keyframe_poses, keyframe_observations, sparse_map, camera_matrix)
+    before_mean = before_stats["mean"] if before_stats else 0.0
+    points_snapshot = sparse_map.points.copy()
+    poses_snapshot = list(keyframe_poses)
+    n_loop_edges_before = len(sparse_map.loop_edges)
+
+    _apply_loop_correction(
+        sparse_map, keyframe_poses, candidate_kf, new_kf_idx, s_geo, R_geo, t_geo,
+        args.loop_essential_min_shared,
+    )
+
+    after_stats = _reprojection_error_stats(keyframe_poses, keyframe_observations, sparse_map, camera_matrix)
+    after_mean = after_stats["mean"] if after_stats else None
+    regressed = after_stats is None or after_mean > before_mean + args.loop_reject_worse_by
+
+    if regressed:
+        sparse_map.points[:] = points_snapshot
+        for k in range(len(keyframe_poses)):
+            keyframe_poses[k] = poses_snapshot[k]
+        sparse_map.discard_loop_edges_since(n_loop_edges_before)
+        return {"candidate": candidate_kf, "similarity": similarity, "verified": True,
+                "accepted": False, "n_matches": n_matches, "n_inliers": n_inliers,
+                "mean_reproj_before": before_mean, "mean_reproj_after": after_mean,
+                "n_ba_outliers": 0, "n_ba_culled": 0}
+
+    n_ba_outliers, n_ba_culled = 0, 0
+    if not args.no_ba:
+        ba_result = _run_global_ba(
+            keyframe_poses, keyframe_observations, sparse_map, camera_matrix,
+            max_nfev=args.global_ba_max_nfev, ftol=args.global_ba_ftol, xtol=args.global_ba_xtol,
+            outlier_chi2_threshold=args.ba_outlier_chi2,
+        )
+        _, _, n_ba_outliers, n_ba_culled = _validate_and_apply_ba(
+            ba_result, keyframe_poses, keyframe_observations, sparse_map, recent_step_sizes,
+            keyframe_poses[new_kf_idx].R, keyframe_poses[new_kf_idx].t,
+            args.global_ba_max_plausible_rotation, args.global_ba_max_step_ratio,
+            new_kf_idx,
+        )
+
+    return {"candidate": candidate_kf, "similarity": similarity, "verified": True,
+            "accepted": True, "n_matches": n_matches, "n_inliers": n_inliers,
+            "mean_reproj_before": before_mean, "mean_reproj_after": after_mean,
+            "n_ba_outliers": n_ba_outliers, "n_ba_culled": n_ba_culled}
+
+
 def _demo():
     import argparse
     import time
@@ -2041,7 +2408,112 @@ def _demo():
                               "--relocalize's own help text documents")
     parser.add_argument("--clip-model", default="pipeline/models/clip_vit_b32_vision.onnx",
                          help="Path to the CLIP vision-encoder ONNX checkpoint (used if "
-                              "--appearance-relocalize is set) - see pipeline/clip_ml.py")
+                              "--appearance-relocalize or --loop-closing is set) - see "
+                              "pipeline/clip_ml.py")
+    parser.add_argument("--loop-closing", action="store_true",
+                         help="Extension beyond the paper's own concurrent design (#55, "
+                              "the paper's §VII, adapted here as a discrete step run inline at "
+                              "keyframe insertion rather than a separate always-on thread - #51's "
+                              "still-separate, not-yet-built scope): on every new keyframe, embed "
+                              "it with CLIP (--clip-model, independent of --appearance-relocalize - "
+                              "this runs whether or not that flag is set) and compare it against "
+                              "every earlier, non-covisible keyframe's own stored embedding; the "
+                              "highest-similarity keyframe above --loop-clip-threshold is a loop "
+                              "candidate. If found, verify it geometrically by matching the two "
+                              "keyframes' own observed map-point descriptors directly against each "
+                              "other (3D-3D, not 2D-3D PnP) and RANSAC-fitting a Sim(3) - not just "
+                              "SE(3): this pipeline's single, continuously-extended map has one "
+                              "arbitrary scale fixed at bootstrap, but nothing keeps a keyframe "
+                              "long after a tracking-loss gap at exactly that same effective scale "
+                              "as one from before it (paper §VII-B) - with a deliberately looser "
+                              "inlier/reprojection bar than --pnp-min-inliers (see "
+                              "--loop-min-inliers/--loop-reproj-threshold-px): #50 already showed "
+                              "the ordinary PnP bar is not clearable here even against the "
+                              "correctly-recognized keyframe, and a loop constraint only needs to "
+                              "be roughly right, since the Essential Graph pose-graph optimization "
+                              "that follows (over Map's own covisibility graph plus every verified "
+                              "loop edge - see Map.essential_graph_covisibility_edges/loop_edges) is "
+                              "what actually distributes/smooths the correction, unlike ordinary "
+                              "tracking's PnP pose, which IS the trajectory. The raw correction is "
+                              "rejected (and rolled back) if it makes the map's own mean "
+                              "reprojection error worse rather than better (see "
+                              "--loop-reject-worse-by) - a direct defense against the false-"
+                              "positive risk this loosened bar deliberately trades for. Off by "
+                              "default: a sequence that never revisits a non-covisible part of the "
+                              "map makes zero extra calls either way, but one that does will pay "
+                              "CLIP-embedding cost on every keyframe (not just during relocalization "
+                              "like --appearance-relocalize) plus, rarely, a Sim(3) RANSAC + "
+                              "whole-trajectory pose-graph solve + full BA cleanup pass")
+    parser.add_argument("--loop-clip-threshold", type=float, default=0.75,
+                         help="Minimum CLIP cosine similarity (--loop-closing) for an earlier, "
+                              "non-covisible keyframe to be flagged a loop candidate at all - see "
+                              "--appearance-relocalize's own --help for this same metric's "
+                              "validated-but-noisy correlation with physical proximity (#50, "
+                              "Pearson r=-0.48 vs. ground-truth distance); a candidate this loose "
+                              "still has to separately pass geometric verification before any "
+                              "correction is applied, so this threshold mainly bounds how much "
+                              "wasted verification work a visually-similar-but-wrong keyframe can "
+                              "trigger, not correctness on its own")
+    parser.add_argument("--loop-min-keyframe-gap", type=int, default=30,
+                         help="Minimum keyframe-index gap (--loop-closing) between a candidate and "
+                              "the current keyframe - a revisit only means something once enough "
+                              "of the map has been built since to not just be neighbors in an "
+                              "otherwise-continuous pass over the same area (the covisibility "
+                              "exclusion in --loop-closing's own --help already rules out "
+                              "immediate neighbors with shared structure; this additionally rules "
+                              "out nearby-but-not-quite-covisible ones)")
+    parser.add_argument("--loop-min-matches", type=int, default=12,
+                         help="Minimum 3D-3D descriptor-matched correspondences (--loop-closing) "
+                              "between a candidate keyframe's own observed map points and the "
+                              "current keyframe's before even attempting Sim(3) RANSAC (umeyama_"
+                              "alignment's own minimum is 3, but that few would make RANSAC's own "
+                              "inlier count nearly meaningless)")
+    parser.add_argument("--loop-min-inliers", type=int, default=8,
+                         help="Minimum Sim(3) RANSAC inlier count (--loop-closing) to accept "
+                              "geometric verification - deliberately looser than --pnp-min-"
+                              "inliers's default (20): see --loop-closing's own --help for why a "
+                              "loop constraint only needs to be roughly right, and #50's findings "
+                              "on how sparse literal correspondence is here")
+    parser.add_argument("--loop-reproj-threshold-px", type=float, default=8.0,
+                         help="Reprojection-error inlier bound in pixels (--loop-closing) for "
+                              "Sim(3) RANSAC - looser than local BA's own Huber transition point "
+                              "(--outlier-threshold-px isn't itself a flag, but local_bundle_"
+                              "adjustment's default is 3.0px) for the same reason as "
+                              "--loop-min-inliers: this is a loop CANDIDATE'S verification, not "
+                              "the trajectory itself")
+    parser.add_argument("--loop-ransac-iterations", type=int, default=500,
+                         help="RANSAC iteration count (--loop-closing) for Sim(3) geometric "
+                              "verification - higher than a typical PnP/essential-matrix RANSAC's "
+                              "effective iteration count since the correspondence sets here are "
+                              "small (see --loop-min-matches) and a 3-point minimal sample is more "
+                              "sensitive to outliers than PnP's, needing more samples for the same "
+                              "confidence of finding an outlier-free one")
+    parser.add_argument("--loop-max-scale-drift", type=float, default=3.0,
+                         help="Reject a geometrically-verified loop closure (--loop-closing) if "
+                              "its fitted Sim(3) scale falls outside [1/this, this] - a sanity "
+                              "bound against accepting an implausible scale jump as \"verified\"; "
+                              "real accumulated monocular scale drift over one map should be "
+                              "gradual, not multiple times off, so a fit landing outside this range "
+                              "is far more likely a false-positive alignment than genuine drift")
+    parser.add_argument("--loop-essential-min-shared", type=int, default=30,
+                         help="Minimum shared-point weight (--loop-closing) for a covisibility "
+                              "edge to be included in the Essential Graph pose-graph optimization "
+                              "(Map.essential_graph_covisibility_edges) on top of the always-"
+                              "included sequential (kf_i, kf_i+1) edges and every verified loop "
+                              "edge - higher than --covisibility-min-shared isn't itself a flag; "
+                              "Map's own covisibility_min_shared default (15) already reflects this "
+                              "project's smaller map/feature scale vs. the paper's own, so this "
+                              "defaults higher than that (not the paper's absolute figure of 100, "
+                              "which assumes a much larger map) to keep the Essential Graph a "
+                              "genuinely sparser subgraph")
+    parser.add_argument("--loop-reject-worse-by", type=float, default=0.5,
+                         help="Roll back a speculatively-applied loop correction (--loop-closing) "
+                              "if the map's own mean reprojection error (px, across every keyframe "
+                              "observation) increases by more than this after correction - a "
+                              "direct, cheap defense against the false-positive risk --loop-closing's "
+                              "own loosened verification bar trades for (see its --help): a wrong "
+                              "place accepted with high confidence should make the map LESS self-"
+                              "consistent, not more")
     parser.add_argument("--ba-every", type=int, default=1,
                          help="Only run local bundle adjustment every Nth accepted keyframe "
                               "(default: every keyframe) - applies to the TRACK branch's "
@@ -2175,12 +2647,14 @@ def _demo():
     keyframe_kp = [None]
     keyframe_desc = [None]
     # keyframe_clip_embedding[i]: the i-th keyframe's CLIP appearance
-    # embedding (#50), computed once at keyframe-insertion time - stays None
-    # for every keyframe when --appearance-relocalize is off, and for index 0
-    # (the pre-bootstrap placeholder) regardless, same convention as
-    # keyframe_kp/keyframe_desc above. --relocalize's own candidate-keyframe
-    # search reads this to rank keyframes by appearance before falling back
-    # to its existing unrestricted full-map search.
+    # embedding, computed once at keyframe-insertion time - stays None for
+    # every keyframe when NEITHER --appearance-relocalize (#50) NOR
+    # --loop-closing (#55) is set, and for index 0 (the pre-bootstrap
+    # placeholder) regardless, same convention as keyframe_kp/keyframe_desc
+    # above. --relocalize's own candidate-keyframe search (#50) reads this
+    # to rank keyframes by appearance before falling back to its existing
+    # unrestricted full-map search; --loop-closing (#55) reads it to detect
+    # a revisit of an earlier, non-covisible keyframe on every new keyframe.
     keyframe_clip_embedding = [None]
 
     ref_kp = None
@@ -2300,11 +2774,22 @@ def _demo():
     last_depth_vis = None
     depth_rows = None
 
-    # --appearance-relocalize state (#50): a CLIP vision encoder, used both
-    # to embed each new keyframe (below) and, inside the relocalization
-    # block, to embed the current lost frame for ranking against those
-    # stored embeddings.
-    clip_embedder = CLIPEmbedder(args.clip_model) if args.appearance_relocalize else None
+    # --appearance-relocalize (#50) / --loop-closing (#55) shared state: a
+    # CLIP vision encoder, used to embed each new keyframe (below) and
+    # either the current lost frame (relocalization's own appearance
+    # pre-filter) or the new keyframe itself (loop-candidate detection)
+    # for ranking against those stored embeddings. Independent gating -
+    # --loop-closing runs loop detection on every keyframe regardless of
+    # whether tracking ever loses the map, unlike --appearance-relocalize's
+    # own relocalization-only pre-filter - either flag alone is enough to
+    # need the embedder.
+    clip_embedder = (
+        CLIPEmbedder(args.clip_model)
+        if (args.appearance_relocalize or args.loop_closing) else None
+    )
+    n_loop_candidates_detected = 0
+    n_loop_verified = 0
+    n_loop_closed = 0
 
     with open_calibrated_source(args.video, args.calibration) as frames:
         K = frames.camera_matrix_undistorted
@@ -2483,6 +2968,36 @@ def _demo():
                             )
                             total_keyframes_culled += len(culled_kfs)
                             total_culled_from_keyframe_cull += len(culled_pts_kf)
+                        if args.loop_closing:
+                            loop_result = _run_loop_closing(
+                                sparse_map, keyframe_poses, keyframe_observations,
+                                keyframe_clip_embedding, new_kf_idx,
+                                keyframe_clip_embedding[new_kf_idx], K,
+                                recent_step_sizes, args,
+                            )
+                            if loop_result is not None:
+                                n_loop_candidates_detected += 1
+                                n_loop_verified += int(loop_result["verified"])
+                                n_loop_closed += int(loop_result["accepted"])
+                                total_ba_outliers_discarded += loop_result["n_ba_outliers"]
+                                total_culled_from_ba_outliers += loop_result["n_ba_culled"]
+                                if loop_result["accepted"]:
+                                    R_pos, t_pos = keyframe_poses[new_kf_idx].R, keyframe_poses[new_kf_idx].t
+                                    # Scale may have changed (Sim(3) correction) -
+                                    # buffered step sizes describe the OLD scale,
+                                    # same reasoning as relocalization's own
+                                    # recent_step_sizes.clear() after a comparable
+                                    # pose "jump".
+                                    recent_step_sizes.clear()
+                                detail = (
+                                    f"{loop_result['n_inliers']}/{loop_result['n_matches']} "
+                                    f"Sim(3) RANSAC inliers" if loop_result["verified"]
+                                    else "verification failed"
+                                )
+                                print(f"    [loop closing (#55): candidate keyframe "
+                                      f"{loop_result['candidate']} "
+                                      f"(similarity={loop_result['similarity']:.2f}), {detail}, "
+                                      f"{'CLOSED' if loop_result['accepted'] else 'rejected'}]")
                         n_keyframes += 1
                         is_keyframe = True
                         status = (f"BOOTSTRAP ({int(valid.sum())} points seeded, "
@@ -2809,6 +3324,39 @@ def _demo():
                                               f"newly dropped below 3 observing keyframes "
                                               f"as a result]")
 
+                                if args.loop_closing:
+                                    loop_result = _run_loop_closing(
+                                        sparse_map, keyframe_poses, keyframe_observations,
+                                        keyframe_clip_embedding, new_kf_idx,
+                                        keyframe_clip_embedding[new_kf_idx], K,
+                                        recent_step_sizes, args,
+                                    )
+                                    if loop_result is not None:
+                                        n_loop_candidates_detected += 1
+                                        n_loop_verified += int(loop_result["verified"])
+                                        n_loop_closed += int(loop_result["accepted"])
+                                        total_ba_outliers_discarded += loop_result["n_ba_outliers"]
+                                        total_culled_from_ba_outliers += loop_result["n_ba_culled"]
+                                        if loop_result["accepted"]:
+                                            R_pos = keyframe_poses[new_kf_idx].R
+                                            t_pos = keyframe_poses[new_kf_idx].t
+                                            # Scale may have changed (Sim(3)
+                                            # correction) - buffered step sizes
+                                            # describe the OLD scale, same
+                                            # reasoning as relocalization's own
+                                            # recent_step_sizes.clear() after a
+                                            # comparable pose "jump".
+                                            recent_step_sizes.clear()
+                                        detail = (
+                                            f"{loop_result['n_inliers']}/{loop_result['n_matches']} "
+                                            f"Sim(3) RANSAC inliers" if loop_result["verified"]
+                                            else "verification failed"
+                                        )
+                                        print(f"    [loop closing (#55): candidate keyframe "
+                                              f"{loop_result['candidate']} "
+                                              f"(similarity={loop_result['similarity']:.2f}), {detail}, "
+                                              f"{'CLOSED' if loop_result['accepted'] else 'rejected'}]")
+
                                 if args.depth_densify:
                                     if depth_rows is None:
                                         depth_rows = scanline_rows(
@@ -2973,7 +3521,16 @@ def _demo():
                     # physical proximity, but too noisy to trust as a hard
                     # filter).
                     candidate_masks = []
-                    if clip_embedder is not None:
+                    # args.appearance_relocalize, not just clip_embedder is
+                    # not None: clip_embedder is now ALSO built for
+                    # --loop-closing alone (see its own construction above) -
+                    # without this check, --loop-closing --relocalize (no
+                    # --appearance-relocalize) would silently run this
+                    # restricted-candidate pre-filter anyway, changing which
+                    # pose relocalization recovers with no flag asking for it
+                    # and no stats printed to reveal it (the block below is
+                    # gated by args.appearance_relocalize too).
+                    if clip_embedder is not None and args.appearance_relocalize:
                         appearance_start = time.perf_counter()
                         frame_clip_embedding = clip_embedder.embed(frame.image)
                         clip_best_kf, clip_best_sim = None, -1.0
@@ -3242,6 +3799,11 @@ def _demo():
                   f"{total_appearance_prefilter_time:.2f}s CLIP-embedding overhead total "
                   f"({appearance_avg_ms:.1f}ms/attempt, not included in relocalization's own "
                   f"total above)]")
+    if args.loop_closing:
+        print(f"    [loop closing (#55): {n_loop_candidates_detected} candidates detected "
+              f"(CLIP similarity >= {args.loop_clip_threshold}), {n_loop_verified} passed "
+              f"Sim(3) geometric verification, {n_loop_closed} actually closed (kept after the "
+              f"mean-reprojection-error regression check - see --loop-reject-worse-by)]")
     if args.rotation_only_fallback:
         avg_ms = (
             1000 * total_rotation_fallback_time / n_rotation_fallback_attempts
