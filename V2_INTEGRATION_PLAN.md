@@ -19,6 +19,20 @@ section already lays out roughly the right order to change that (bootstrap
 scale → triangulation gaps → point confirmation → pose plausibility), tied
 to specific code in `mapping.py`/`triangulation.py`.
 
+**Baseline to build against ([#58](https://github.com/albinjanssonsand/slam/issues/58)):**
+`main`'s default flags cost ~15-20 min/798 frames on `freiburg1_xyz` for
+machinery (#21/#22/#24) whose accuracy payoff lands almost entirely on
+`freiburg1_desk`/`freiburg1_room`/`freiburg2_pioneer_slam2`, not on the two
+ground-truth sequences this comparison actually runs on. Use
+`--orb-single-pass --essential-only-bootstrap --single-keyframe-point-creation`
+instead: 4m48s on `freiburg1_xyz` (68 keyframes, 86.6% coverage, ATE/RPE
+RMSE 0.0317/0.0302 - notably *better* than the full-machinery default's
+0.0702/0.0898, an unexplained but real result, see `EVALUATION_RESULTS.md`'s
+`#58` section) and 23m50s on `freiburg2_xyz` (227 keyframes, 99.6% coverage,
+ATE/RPE RMSE 0.1015/0.0329). #7's own scope (closed `NOT_PLANNED` when the
+#19 paper-alignment sprint took priority) should be re-opened against this
+baseline, not the pre-#58 default-flags one.
+
 ## Blockers/dependencies before ML depth can actually help
 
 1. **The model is relative depth, not metric.** Depth Anything V2 *Small*
