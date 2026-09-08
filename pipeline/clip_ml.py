@@ -10,7 +10,9 @@ matching against them, so a revisited scene can be recognized despite
 viewpoint/lighting changes that break literal point correspondence (what
 DBoW2 does for the reference paper - see EVALUATION_RESULTS.md's "#49"
 section for why plain point matching alone doesn't recover freiburg1_desk's
-whip-pan gap).
+whip-pan gap). Also used, independently, by --loop-closing (#55) for loop-
+candidate detection - the same appearance-based recognition, just run on
+every new keyframe rather than only during relocalization.
 """
 
 import cv2
