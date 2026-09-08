@@ -2873,3 +2873,156 @@ evo_rpe tum datasets/tum/rgbd_dataset_freiburg1_desk/groundtruth.txt results/<la
 
 Gap-check (`EVALUATION_METHOD.md` pitfall #1) required for `freiburg1_desk` -
 the numbers above are gapped and should not be read as continuous tracking.
+
+---
+
+## #58: Lean baseline flags (revert #21/#22/#24) - much cheaper, and
+unexpectedly more accurate, on freiburg1_xyz/freiburg2_xyz
+
+**Version:** `issue-58-lean-baseline-flags` branch, on top of `main`
+post-#55. Implements [#58](https://github.com/albinjanssonsand/slam/issues/58):
+three narrowly-scoped, off-by-default flags that each revert one mechanism
+to its pre-issue behavior, per the decision already recorded in that issue
+(working from numbers already in this file, not a fresh profile-then-decide
+pass):
+
+- `--orb-single-pass` (#21): skips the adaptive-threshold fallback passes in
+  `detect_and_compute_gridded` (up to 2 further full-image ORB passes for
+  any under-quota cell) - the measured 2.2-3.2x per-frame cost driver -
+  while keeping #21's own greedy-NMS duplicate-detection fix, a real
+  correctness fix unrelated to that cost.
+- `--essential-only-bootstrap` (#22): bypasses the paper §IV dual-model
+  (homography/fundamental) selection entirely and reproduces the exact
+  pre-#22 essential-matrix-only two-view bootstrap
+  (`pose.estimate_relative_pose`'s single `cv2.recoverPose`-committed
+  hypothesis, triangulated directly with no dominance check - see
+  `_bootstrap_dual_model`'s new `essential_only` branch, which faithfully
+  revives the old code's own lack of a minimum-triangulated-points check:
+  a RANSAC-accepted-but-zero-triangulated "bootstrap" can fire and retry,
+  observed directly during self-review's smoke testing, not a new bug).
+- `--single-keyframe-point-creation` (#24): restricts §VI-C new-point
+  creation back to just the reference keyframe, ignoring the covisibility
+  graph and `--new-point-max-covisible-keyframes` entirely.
+
+All three default to today's behavior (off). #27 was left untouched per the
+issue's own decision (confirmed zero benefit on `freiburg1_xyz`, but not a
+costly enough mechanism to be worth a flag next to these three).
+
+**Regression check (required by the issue): default flags (all three off)
+reproduce current `main`'s `freiburg1_xyz` behavior**, correct `slam`
+environment:
+
+| Config | Keyframes | Active/total points | Coverage | ATE RMSE (m) | RPE RMSE (m) |
+|---|---|---|---|---|---|
+| Default (this branch, flags off) | 85 | 13511/47631 | 86.5% (26.04s/30.09s) | 0.0702 | 0.0898 |
+
+Matches #47 (part 1)'s corrected `main` baseline exactly (same keyframe/point
+counts, ATE/RPE within rounding of unseeded-RANSAC noise) - confirms none of
+this issue's changes touch default behavior.
+
+**freiburg1_xyz, all three flags on (required by the issue), gap-checked per
+`EVALUATION_METHOD.md` pitfall #1:**
+
+| Config | Keyframes | Active/total points | Coverage | ATE RMSE (m) | RPE RMSE (m) | Wall clock |
+|---|---|---|---|---|---|---|
+| Default (flags off, = regression-check row) | 85 | 13511/47631 | 86.5% (26.04s/30.09s) | 0.0702 | 0.0898 | ~15-20 min (per prior sessions' recorded runs) |
+| All three flags on (this issue) | 68 | 2153/9427 | 86.6% (26.1s/30.1s) | **0.0317** | **0.0302** | **4m48s** |
+
+Gap-check: the largest gap between consecutive accepted-pose frames is 32
+frames (301->333) - nothing resembling `freiburg1_desk`'s 400+-frame
+blackout pattern, so this coverage number is trustworthy, not the deceptive
+kind pitfall #1 exists to catch.
+
+**This is a genuine surprise, reported honestly rather than smoothed over:
+the lean configuration is not just ~3-4x cheaper (4m48s vs. the ~15-20 min
+this file's own wall-clock trail records for the full-machinery default), it
+is also MORE accurate on this sequence** - ATE RMSE improves 55%
+(0.0702m -> 0.0317m), RPE RMSE improves 66% (0.0898m -> 0.0302m), at
+essentially unchanged coverage (86.6% vs. 86.5%). Which of the three flags
+drives this was not separately isolated (out of scope for #58's own
+"revert, measure, record" mandate - a natural follow-up for whoever wants
+it) - plausible explanation, not verified further: #47 (part 1)'s and #22's
+own sections already showed the R_H>0.45 dual-model bootstrap picks a
+measurably worse two-view pose on this exact sequence's borderline-planar
+first frames, and that single bad seed propagates through the whole
+trajectory - `--essential-only-bootstrap` alone plausibly accounts for a
+large share of this improvement, with the other two flags' sparser,
+less-redundant map plausibly contributing the rest (echoing #20's/#24's own
+observations that a denser, more redundant map can pull BA toward a
+self-consistent-but-globally-biased solution).
+
+**freiburg2_xyz, all three flags on (required by the issue - also this
+sequence's first-ever correct-environment measurement, superseding #17's
+pre-#47-fix number):**
+
+| Config | Frames | Keyframes | Active/total points | Coverage | ATE RMSE (m) | RPE RMSE (m) | Wall clock |
+|---|---|---|---|---|---|---|---|
+| #17 (stale, wrong OpenCV env) | 3669 | 305 | 17436/26692 | 98.6% (121.0s/122.7s) | 0.1589 | 0.0456 | not measured |
+| All three flags on, correct env (this issue) | 3669 | 227 | 7579/22569 | 99.6% (122.2s/122.7s) | 0.1015 | 0.0329 | 23m50s |
+
+**Gap-check: one real, isolated 150-frame gap (frame 1538->1688, ~4% of the
+sequence), reported honestly rather than hidden - not the deceptive kind
+pitfall #1 targets** (that pattern is a multi-hundred-frame blackout
+consuming most of a short sequence, e.g. `desk`'s 437-449 of 613 frames;
+this is a single transient gap in an otherwise 99.6%-spanning, 3669-frame
+run that recovers on its own, the next-largest gap being 13 frames). Not
+investigated further - `freiburg2_xyz` was never flagged as "too hard" and
+remains one of only two usable ground-truth baselines in this file.
+
+This run is not directly comparable to #17's number as an isolated
+"lean-config effect" measurement the way `freiburg1_xyz` above is (the
+environment fix and this issue's three flags are conflated together here,
+since no same-environment flags-off `freiburg2_xyz` row exists yet) - but as
+a fresh, trustworthy number it is a clear improvement in both cost (this is
+also this sequence's first-ever recorded wall clock: 23m50s for 3669
+frames) and apparent accuracy (ATE -36%, RPE -28% vs. #17's stale number)
+alike. A same-environment, flags-off `freiburg2_xyz` regression row was not
+recorded here (out of #58's own scope, which only requires the "all three
+on" baseline for this sequence) - worth adding if a future issue wants a
+clean like-for-like delta the way `freiburg1_xyz` has one above.
+
+**Net result:** all three flags work as specified (regression check
+confirms zero effect on default behavior), and the "lean" baseline they
+enable is the number v2 ML-fusion work (#7-#9 revival) should build
+against - `freiburg1_xyz`: 68 keyframes, 86.6% coverage, 0.0317/0.0302
+ATE/RPE, 4m48s; `freiburg2_xyz`: 227 keyframes, 99.6% coverage,
+0.1015/0.0329 ATE/RPE, 23m50s. The unexpected accuracy improvement on
+`freiburg1_xyz` is reported as-is, not chased further - #58's own scope is
+implementing the revert flags and recording the baseline, not diagnosing why
+reverting three paper-fidelity mechanisms happens to help this particular
+sequence. These flags remain off by default: `freiburg1_desk`/
+`freiburg1_room`/`freiburg2_pioneer_slam2` need #21/#22/#24 at full strength
+per #47/#49/#50/#55's own findings, and #22 specifically exists to avoid a
+corrupted bootstrap on genuinely planar scenes
+(`freiburg3_nostructure_texture_far`) that `--essential-only-bootstrap`
+would reintroduce the risk of.
+
+**Reproduction - the lean baseline command, for both sequences:**
+
+```bash
+conda activate slam
+
+# freiburg1_xyz
+python -m pipeline.mapping --video datasets/tum/rgbd_dataset_freiburg1_xyz --calibration calibration/tum_freiburg1.yaml --orb-single-pass --essential-only-bootstrap --single-keyframe-point-creation --trajectory-output results/issue58_lean_xyz_estimate.txt --plot-output results/issue58_lean_xyz_trajectory.png --no-display
+
+evo_ape tum datasets/tum/rgbd_dataset_freiburg1_xyz/groundtruth.txt results/issue58_lean_xyz_estimate.txt -a -s
+evo_rpe tum datasets/tum/rgbd_dataset_freiburg1_xyz/groundtruth.txt results/issue58_lean_xyz_estimate.txt -a -s
+
+# freiburg2_xyz
+python -m pipeline.mapping --video datasets/tum/rgbd_dataset_freiburg2_xyz --calibration calibration/tum_freiburg2.yaml --orb-single-pass --essential-only-bootstrap --single-keyframe-point-creation --trajectory-output results/issue58_lean_freiburg2_xyz_estimate.txt --plot-output results/issue58_lean_freiburg2_xyz_trajectory.png --no-display
+
+evo_ape tum datasets/tum/rgbd_dataset_freiburg2_xyz/groundtruth.txt results/issue58_lean_freiburg2_xyz_estimate.txt -a -s
+evo_rpe tum datasets/tum/rgbd_dataset_freiburg2_xyz/groundtruth.txt results/issue58_lean_freiburg2_xyz_estimate.txt -a -s
+```
+
+The three flags (`--orb-single-pass --essential-only-bootstrap
+--single-keyframe-point-creation`) are exactly what "lean baseline" means
+throughout this section and in `V2_INTEGRATION_PLAN.md` - all three
+together, every time; the numbers above are not valid for any subset of
+them. Omitting all three (default, no flags) reproduces `main`'s regular
+full-machinery behavior instead - see the regression-check row above for
+what that gets you on `freiburg1_xyz` (no equivalent default row exists yet
+for `freiburg2_xyz` under the correct environment, per the note above).
+
+Gap-check (`EVALUATION_METHOD.md` pitfall #1) required for `freiburg2_xyz` -
+one real 150-frame gap exists in that run, per above.

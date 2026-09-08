@@ -815,7 +815,8 @@ def estimate_pose_pnp(object_points, image_points, camera_matrix):
 def _bootstrap_dual_model(ref_kp, kp, matches, pts1, pts2, camera_matrix,
                            min_pose_inliers, min_triangulation_angle,
                            pyramid_scale_factor, max_reproj_chi2, max_scale_ratio_factor,
-                           min_triangulated=50, homography_select_threshold=0.45):
+                           min_triangulated=50, homography_select_threshold=0.45,
+                           essential_only=False):
     """
     Paper §IV automatic initialization: estimate a homography and a
     fundamental matrix in parallel over the SAME matches (steps 1-2), score
@@ -863,16 +864,63 @@ def _bootstrap_dual_model(ref_kp, kp, matches, pts1, pts2, camera_matrix,
                                                 selected model's RANSAC inliers (what was triangulated)
       points_3d, valid, in_front, parallax_deg - triangulate()'s own outputs for the winning
                                                 hypothesis, over inlier_mask-selected pts1/pts2
+
+    essential_only (#58): bypasses steps 1-4 entirely and reproduces the
+    exact pre-#22 essential-matrix-only path instead - a single
+    cv2.recoverPose-committed hypothesis via pose.estimate_relative_pose,
+    triangulated directly with no dominance/best-vs-runner-up check (there's
+    only one hypothesis, so none is needed - matching the old code, which
+    accepted bootstrap on RANSAC inlier count alone). Returned in the same
+    dict shape as the dual-model path above (model="E", R_H=nan - not a
+    meaningful score here, kept only so the caller's existing "R_H=%.2f"
+    logging doesn't need a special case) so _demo()'s bootstrap branch needs
+    no changes to consume either path. Exists so a lean baseline for v2
+    ML-fusion work (#58) can opt out of #22's measured freiburg1_xyz
+    regression (see EVALUATION_RESULTS.md's #22/#47/#58 sections) - off by
+    default, since freiburg3_nostructure_texture_far-style planar scenes
+    need the dual-model check to avoid a corrupted bootstrap.
     """
     from pipeline.pose import (
         compose_pose, decompose_essential, decompose_homography,
-        estimate_fundamental_matrix, estimate_homography,
+        estimate_fundamental_matrix, estimate_homography, estimate_relative_pose,
         fundamental_score, homography_score,
     )
     from pipeline.triangulation import triangulate
 
     if len(matches) < 8:
         return None
+
+    if essential_only:
+        result = estimate_relative_pose(ref_kp, kp, matches, camera_matrix)
+        if result is None:
+            return None
+        R_rel, t_rel, mask_pose, _, _ = result
+        inlier_mask = mask_pose.ravel().astype(bool)
+        n_inliers = int(inlier_mask.sum())
+        base = dict(model="E", R_H=float("nan"), n_hypotheses=1, n_inliers=n_inliers)
+        if n_inliers < min_pose_inliers:
+            return dict(base, accepted=False, best_n=0)
+
+        match_list = [m for m, keep in zip(matches, inlier_mask) if keep]
+        octave1 = np.array([ref_kp[m.queryIdx].octave for m in match_list])
+        octave2 = np.array([kp[m.trainIdx].octave for m in match_list])
+        R_id, t_id = np.eye(3), np.zeros((3, 1))
+        R_new, t_new = compose_pose(R_id, t_id, R_rel, t_rel)
+        points_3d, valid, in_front, parallax_deg = triangulate(
+            R_id, t_id, R_new, t_new, camera_matrix,
+            pts1[inlier_mask], pts2[inlier_mask],
+            min_parallax_deg=min_triangulation_angle,
+            octave1=octave1, octave2=octave2,
+            pyramid_scale_factor=pyramid_scale_factor,
+            max_reproj_chi2=max_reproj_chi2,
+            max_scale_ratio_factor=max_scale_ratio_factor,
+        )
+        base["best_n"] = int(valid.sum())
+        return dict(
+            base, accepted=True, R_rel=R_rel, t_rel=t_rel,
+            inlier_mask=inlier_mask, points_3d=points_3d, valid=valid,
+            in_front=in_front, parallax_deg=parallax_deg,
+        )
 
     h_result = estimate_homography(pts1, pts2)
     f_result = estimate_fundamental_matrix(pts1, pts2)
@@ -2187,6 +2235,22 @@ def _demo():
                          help="ROWSxCOLS grid for per-cell ORB feature quotas, so a richly "
                               "textured region (e.g. a near object) can't consume the whole "
                               "feature budget and starve other regions (e.g. the background)")
+    parser.add_argument("--orb-single-pass", action="store_true",
+                         help="Skip #21's adaptive-threshold fallback passes (up to 2 further "
+                              "full-image ORB passes for any cell still short of its quota at "
+                              "the default FAST threshold) - the measured cost driver behind "
+                              "detect_and_compute_gridded's 2.2-3.2x per-frame slowdown vs. the "
+                              "pre-#21 implementation (31.5ms -> 70-100ms, see "
+                              "EVALUATION_RESULTS.md's #21/#58 sections). Keeps the single-"
+                              "full-image-pyramid construction and greedy-NMS duplicate-"
+                              "detection fix #21 also made (a real correctness fix, not part "
+                              "of the cost this flag trims) - only the fallback retries are "
+                              "skipped, so under-quota cells simply stay under quota rather "
+                              "than getting a second chance at a lower threshold. Off by "
+                              "default: exists so a lean baseline for v2 ML-fusion work (#58) "
+                              "can opt out of this cost, not to change anyone else's default "
+                              "behavior - freiburg1_desk/room/pioneer_slam2 want the richer "
+                              "per-cell coverage the fallback passes buy")
     parser.add_argument("--ratio", type=float, default=0.75, help="Lowe's ratio test threshold")
     parser.add_argument("--min-parallax", type=float, default=10.0,
                          help="Minimum median pixel displacement vs the reference frame "
@@ -2245,6 +2309,21 @@ def _demo():
                               "or fundamental matrix - the paper's IV dual-model selection picks, "
                               "see mapping._bootstrap_dual_model) to even attempt motion-hypothesis "
                               "disambiguation for a keyframe")
+    parser.add_argument("--essential-only-bootstrap", action="store_true",
+                         help="Bypass #22's dual-model (homography/fundamental) bootstrap "
+                              "selection and use the pre-#22 essential-matrix-only two-view "
+                              "path instead (pose.estimate_relative_pose's single cv2."
+                              "recoverPose-committed hypothesis, triangulated directly with no "
+                              "dominance check). #22's own regression analysis found the R_H>"
+                              "0.45 heuristic picks a measurably worse two-view pose on "
+                              "freiburg1_xyz's borderline-planar first frames - still the "
+                              "largest live contributor to that sequence's standing ATE/RPE "
+                              "regression even after the #47 environment fix (see "
+                              "EVALUATION_RESULTS.md's #22/#47/#58 sections). Off by default: "
+                              "exists so a lean baseline for v2 ML-fusion work (#58) can opt "
+                              "out, not to change anyone else's default behavior - a genuinely "
+                              "planar scene (e.g. freiburg3_nostructure_texture_far) needs the "
+                              "dual-model check to avoid a corrupted bootstrap")
     parser.add_argument("--pnp-min-inliers", type=int, default=20,
                          help="Minimum PnP inliers required to accept a tracked frame's pose "
                               "(checked every frame, not just when it becomes a keyframe)")
@@ -2285,6 +2364,18 @@ def _demo():
                               "searches for correspondences against - bounds the added "
                               "per-keyframe cost of matching+epipolar-checking against "
                               "multiple keyframes instead of just the previous one")
+    parser.add_argument("--single-keyframe-point-creation", action="store_true",
+                         help="Revert #24's §VI-C new-point creation to the pre-#24 behavior: "
+                              "search only the reference keyframe (the one this keyframe was "
+                              "tracked against), ignoring --new-point-max-covisible-keyframes "
+                              "and the covisibility graph entirely, instead of up to N "
+                              "covisible neighbors. #24's own write-up measured ~1.6x wall-"
+                              "clock cost for this search (see EVALUATION_RESULTS.md's #24/#58 "
+                              "sections) with a mixed RPE-better/ATE-worse effect. Off by "
+                              "default: exists so a lean baseline for v2 ML-fusion work (#58) "
+                              "can opt out of this cost, not to change anyone else's default "
+                              "behavior - a heavily-revisited or slowly-explored scene "
+                              "benefits from the richer covisible-keyframe search")
     parser.add_argument("--max-step-ratio", type=float, default=6.0,
                          help="Reject a PnP pose if the camera-center displacement vs. the "
                               "previous tracked frame exceeds this many multiples of the "
@@ -2798,7 +2889,8 @@ def _demo():
 
         for frame in frames:
             kp, desc = detect_and_compute_gridded(
-                frame.image, args.n_features, grid=(grid_rows, grid_cols)
+                frame.image, args.n_features, grid=(grid_rows, grid_cols),
+                fallback_thresholds=() if args.orb_single_pass else (10, 5),
             )
 
             if ref_desc is None:
@@ -2844,6 +2936,7 @@ def _demo():
                         pyramid_scale_factor=sparse_map.pyramid_scale_factor,
                         max_reproj_chi2=args.triangulation_max_reproj_chi2,
                         max_scale_ratio_factor=args.triangulation_scale_ratio_factor,
+                        essential_only=args.essential_only_bootstrap,
                     )
                     if result is None:
                         status = "bootstrap pose estimation failed"
@@ -3217,9 +3310,12 @@ def _demo():
                                 # already-matched features are excluded on its side
                                 # inside the helper itself.
                                 already_matched_frame_idx = set(frame_indices.tolist())
-                                covisible_candidates = _covisible_candidates(
-                                    sparse_map, new_kf_idx, ref_kf_idx,
-                                    args.new_point_max_covisible_keyframes,
+                                covisible_candidates = (
+                                    [ref_kf_idx] if args.single_keyframe_point_creation
+                                    else _covisible_candidates(
+                                        sparse_map, new_kf_idx, ref_kf_idx,
+                                        args.new_point_max_covisible_keyframes,
+                                    )
                                 )
                                 (new_point_ids, new_source_kf, new_source_pixels,
                                  new_kf_frame_idx_new, new_kf_pixels_new) = (
