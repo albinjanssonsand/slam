@@ -321,7 +321,7 @@ def render_trajectory(positions, map_points=None, ml_points=None,
     cv2.circle(canvas, to_canvas(pos_xz[0]), 7, (0, 160, 0), -1)   # start
     cv2.circle(canvas, to_canvas(pos_xz[-1]), 7, (0, 0, 255), -1)  # latest keyframe
 
-    cv2.putText(canvas, "trajectory + sparse map (top-down)", (10, 25),
+    cv2.putText(canvas, "trajectory + sparse map (top-down view)", (10, 25),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1)
     return canvas
 
@@ -486,7 +486,7 @@ def _demo():
     ax.scatter(positions[-1, 0], positions[-1, 2], c="red", s=80, label="end", zorder=5)
     ax.set_xlabel("X")
     ax.set_ylabel("Z (forward)")
-    ax.set_title("Camera trajectory + sparse map (top-down, arbitrary/inconsistent scale)")
+    ax.set_title("Camera trajectory + sparse map (top-down view, arbitrary/inconsistent scale)")
     ax.axis("equal")
     ax.legend()
     ax.grid(True)

@@ -3960,9 +3960,9 @@ def _demo():
                     )
 
                 window_title = (
-                    "SLAM v1+v2 - map tracking + ML depth densify (bootstrap + PnP)"
+                    "SLAM - live tracking + map + depth"
                     if args.depth_densify else
-                    "SLAM v1 - map tracking (bootstrap + PnP)"
+                    "SLAM - live tracking + map"
                 )
                 cv2.imshow(window_title, combined)
                 if cv2.waitKey(delay_ms) & 0xFF == ord("q"):
@@ -4126,7 +4126,7 @@ def _demo():
     ax.scatter(positions[-1, 0], positions[-1, 2], c="red", s=80, label="end", zorder=5)
     ax.set_xlabel("X")
     ax.set_ylabel("Z (forward)")
-    ax.set_title("Camera trajectory + persistent map (top-down, fixed scale after bootstrap)")
+    ax.set_title("Camera trajectory + persistent map (top-down view, fixed scale after bootstrap)")
     ax.axis("equal")
     ax.legend()
     ax.grid(True)
