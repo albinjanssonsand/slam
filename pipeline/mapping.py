@@ -34,14 +34,27 @@ def _hamming_distances(query_desc, candidate_descs):
     return _POPCOUNT_TABLE[xor].sum(axis=1, dtype=np.int32)
 
 
-def _representative_descriptor(descs):
-    """The observation descriptor with the minimum summed Hamming distance
-    to every other observation of the same point (paper §III-C) - the most
+def _l2_distances(query_desc, candidate_descs):
+    """Euclidean distance from one float descriptor (e.g. SuperPoint's
+    L2-normalized 256-dim embedding) to each row of candidate_descs - see
+    issue #38, the float-descriptor sibling of _hamming_distances."""
+    return np.linalg.norm(candidate_descs - query_desc, axis=1)
+
+
+_DISTANCE_FNS = {"hamming": _hamming_distances, "l2": _l2_distances}
+
+
+def _representative_descriptor(descs, metric="hamming"):
+    """The observation descriptor with the minimum summed distance to every
+    other observation of the same point (paper §III-C) - the most
     centrally-located descriptor among all of a point's observations,
-    rather than simply whichever one was seen last."""
+    rather than simply whichever one was seen last. `metric` picks Hamming
+    (ORB's binary descriptors) or L2 (float descriptors, e.g. SuperPoint's -
+    see issue #38); the "most central" reasoning itself is metric-agnostic."""
     if len(descs) == 1:
         return descs[0]
-    summed = np.array([_hamming_distances(d, descs).sum() for d in descs])
+    distances = _DISTANCE_FNS[metric]
+    summed = np.array([distances(d, descs).sum() for d in descs])
     return descs[np.argmin(summed)]
 
 
@@ -55,8 +68,9 @@ class KeyframePose(NamedTuple):
 
 
 class Map:
-    """A growing set of 3D points, each tied to the ORB descriptor of its most
-    recent observation so future frames can be matched against it directly.
+    """A growing set of 3D points, each tied to a representative descriptor
+    (ORB by default, or SuperPoint's - see descriptor_metric/issue #38) so
+    future frames can be matched against it directly.
 
     Every point is usable for PnP/guided matching/BA from the moment it's
     created - there's no separate provisional/confirmed admission gate.
@@ -76,9 +90,11 @@ class Map:
     """
 
     def __init__(self, pyramid_scale_factor=1.2, pyramid_n_levels=8,
-                 covisibility_min_shared=15):
+                 covisibility_min_shared=15,
+                 descriptor_dim=32, descriptor_dtype=np.uint8, descriptor_metric="hamming"):
         self.points = np.empty((0, 3), dtype=np.float64)
-        self.descriptors = np.empty((0, 32), dtype=np.uint8)
+        self.descriptors = np.empty((0, descriptor_dim), dtype=descriptor_dtype)
+        self.descriptor_metric = descriptor_metric
 
         # §VI-B Recent Map Points Culling bookkeeping: the keyframe a point
         # was created at, how many frames predicted it visible (projected
@@ -100,7 +116,10 @@ class Map:
         # observations arrive - never recomputed over the whole map.
         # pyramid_scale_factor/pyramid_n_levels must match the ORB pyramid
         # actually used for detection (pipeline.features' cv2.ORB_create
-        # calls all use the cv2 defaults of 1.2/8 - see detect_and_compute_gridded).
+        # calls all use the cv2 defaults of 1.2/8 - see detect_and_compute_gridded)
+        # - or, in learned-detector mode, the synthetic octave spacing
+        # pipeline.superpoint_ml's SuperPointEstimator buckets its
+        # confidence scores into (see issue #38); same defaults there too.
         self.viewing_direction = np.empty((0, 3), dtype=np.float64)
         self.d_min = np.empty(0, dtype=np.float64)
         self.d_max = np.empty(0, dtype=np.float64)
@@ -312,11 +331,13 @@ class Map:
         """
         camera_center = np.asarray(camera_center, dtype=np.float64).ravel()
         # .copy(), not .asarray(): descriptor is typically a row-view into a
-        # frame's full (n_features, 32) descriptor array (e.g. desc[fidx] in
+        # frame's full (n_features, D) descriptor array (e.g. desc[fidx] in
         # _demo()) - storing the view as-is would keep that entire array
-        # alive in memory for as long as this one 32-byte observation is
-        # kept, for every observation ever registered.
-        descriptor = np.array(descriptor, dtype=np.uint8, copy=True)
+        # alive in memory for as long as this one observation is kept, for
+        # every observation ever registered. dtype matches this Map's own
+        # descriptor storage (uint8/Hamming for ORB, float32/L2 for
+        # SuperPoint - see issue #38), not a hardcoded literal.
+        descriptor = np.array(descriptor, dtype=self.descriptors.dtype, copy=True)
         obs = self._observations[point_idx]
         obs.append((kf_idx, camera_center, descriptor, int(octave), frame_idx))
         self._recompute_point_metadata(point_idx)
@@ -373,7 +394,7 @@ class Map:
         )
 
         descs = np.array([o[2] for o in obs])
-        self.descriptors[point_idx] = _representative_descriptor(descs)
+        self.descriptors[point_idx] = _representative_descriptor(descs, metric=self.descriptor_metric)
 
     def remove_observation(self, point_idx, kf_idx):
         """
@@ -677,7 +698,7 @@ class Map:
         if len(subset) == 0 or desc is None or len(desc) == 0:
             return np.empty(0, dtype=int), np.empty(0, dtype=int)
 
-        matches = match_descriptors(self.descriptors[subset], desc, ratio)
+        matches = match_descriptors(self.descriptors[subset], desc, ratio, metric=self.descriptor_metric)
         map_indices = subset[[m.queryIdx for m in matches]]
         frame_indices = np.array([m.trainIdx for m in matches], dtype=int)
         return map_indices, frame_indices
@@ -777,7 +798,7 @@ class Map:
             if len(cand) == 0:
                 continue
             cand_desc = desc[cand]
-            dists = _hamming_distances(self.descriptors[subset[local_i]], cand_desc)
+            dists = _DISTANCE_FNS[self.descriptor_metric](self.descriptors[subset[local_i]], cand_desc)
             order = np.argsort(dists)
             if len(order) >= 2 and dists[order[0]] >= ratio * dists[order[1]]:
                 continue
@@ -816,7 +837,7 @@ def _bootstrap_dual_model(ref_kp, kp, matches, pts1, pts2, camera_matrix,
                            min_pose_inliers, min_triangulation_angle,
                            pyramid_scale_factor, max_reproj_chi2, max_scale_ratio_factor,
                            min_triangulated=50, homography_select_threshold=0.45,
-                           essential_only=False):
+                           essential_only=False, essential_only_min_triangulated_floor=False):
     """
     Paper §IV automatic initialization: estimate a homography and a
     fundamental matrix in parallel over the SAME matches (steps 1-2), score
@@ -916,6 +937,35 @@ def _bootstrap_dual_model(ref_kp, kp, matches, pts1, pts2, camera_matrix,
             max_scale_ratio_factor=max_scale_ratio_factor,
         )
         base["best_n"] = int(valid.sum())
+        # min_triangulated floor (same default/standard as the dual-model
+        # path's own check above, just unconditional here - there's only
+        # one hypothesis, so no 90%-of-inliers/70%-of-best dominance check
+        # is meaningful) - OFF BY DEFAULT (essential_only_min_triangulated_
+        # floor=False), matching main's existing essential_only behavior
+        # exactly: an otherwise-still-low-parallax frame can occasionally
+        # pass RANSAC's pose-inlier count while triangulating only a
+        # handful of points that survive by chance, and accepting that as
+        # a permanent bootstrap starves PnP (needs >=6 correspondences) for
+        # the rest of the sequence with no way back (no relocalization -
+        # #13 - yet) - a real gap, but harmless for ORB in practice (a
+        # still-low-parallax frame triangulates exactly 0 points here, not
+        # a handful) and NOT safe to enable unconditionally: confirmed by
+        # direct A/B testing that flipping this on for the plain ORB path
+        # deterministically changes which/how many RANSAC calls happen
+        # before the real bootstrap, which (EVALUATION_METHOD.md pitfall
+        # #3 - OpenCV RANSAC state is process-global and unseeded) shifts
+        # every later RANSAC draw for the rest of the run and regresses
+        # #58's own recorded freiburg1_xyz lean baseline (69 keyframes/
+        # ATE 0.030 measured here -> 28 keyframes/ATE 0.096) - a large,
+        # reproducible effect, not noise, and exactly the kind of change
+        # issue #38's flag-off regression check exists to catch. Enabled
+        # only when the caller is on the learned-detector path (see
+        # _demo()), where SuperPoint's different match-noise
+        # characteristics make this a real, reproducible failure (see
+        # issue #38) that would otherwise block every learned-detector
+        # configuration from ever seeding a usable map.
+        if essential_only_min_triangulated_floor and base["best_n"] < min_triangulated:
+            return dict(base, accepted=False)
         return dict(
             base, accepted=True, R_rel=R_rel, t_rel=t_rel,
             inlier_mask=inlier_mask, points_3d=points_3d, valid=valid,
@@ -1736,7 +1786,7 @@ def _create_new_points_from_covisible_keyframes(
         if len(free_new) == 0 or len(free_i) == 0:
             continue
 
-        matches = match_descriptors(desc_new[free_new], desc_i[free_i], ratio)
+        matches = match_descriptors(desc_new[free_new], desc_i[free_i], ratio, metric=sparse_map.descriptor_metric)
         if len(matches) == 0:
             continue
 
@@ -1965,7 +2015,10 @@ def _verify_loop_closure(sparse_map, keyframe_poses, keyframe_observations,
     if len(cand_ids) < min_matches or len(new_ids) < min_matches:
         return None
 
-    matches = match_descriptors(sparse_map.descriptors[cand_ids], sparse_map.descriptors[new_ids], ratio)
+    matches = match_descriptors(
+        sparse_map.descriptors[cand_ids], sparse_map.descriptors[new_ids], ratio,
+        metric=sparse_map.descriptor_metric,
+    )
     if len(matches) < min_matches:
         return None
 
@@ -2214,6 +2267,8 @@ def _demo():
     from pipeline.clip_ml import CLIPEmbedder
     from pipeline.depth_ml import DepthEstimator, colorize_depth_with_background, scanline_rows
     from pipeline.features import detect_and_compute_gridded, match_descriptors
+    from pipeline.lightglue_ml import LightGlueMatcher
+    from pipeline.superpoint_ml import SuperPointEstimator
     from pipeline.pose import (
         rotation_angle_deg, compose_pose,
         median_parallax, predict_constant_velocity, render_trajectory,
@@ -2251,6 +2306,33 @@ def _demo():
                               "can opt out of this cost, not to change anyone else's default "
                               "behavior - freiburg1_desk/room/pioneer_slam2 want the richer "
                               "per-cell coverage the fallback passes buy")
+    parser.add_argument("--learned-detector",
+                         help="Path to a SuperPoint ONNX checkpoint (e.g. fabio-sim/"
+                              "LightGlue-ONNX's superpoint.onnx export) - replaces "
+                              "detect_and_compute_gridded's ORB detection with a single-pass "
+                              "learned detector+descriptor (see issue #38). Off by default "
+                              "(None): --n-features/--grid/--orb-single-pass all stop applying "
+                              "once set, since this path never calls detect_and_compute_gridded. "
+                              "SuperPoint has no real pyramid octave to report (single-scale, "
+                              "one forward pass - an explicit image pyramid was considered and "
+                              "rejected, see issue #38, as repeating #21/#58's duplicate-"
+                              "detection and per-frame-cost regressions on a second detector); "
+                              "pipeline.superpoint_ml buckets its per-keypoint confidence score, "
+                              "ranked within each frame, into a synthetic octave instead, so "
+                              "d_min/d_max/PredictScale/#33's chi-squared thresholds keep working "
+                              "unchanged")
+    parser.add_argument("--learned-matcher",
+                         help="Path to a LightGlue ONNX checkpoint (e.g. fabio-sim/"
+                              "LightGlue-ONNX's superpoint_lightglue.onnx export) - replaces "
+                              "match_descriptors' classical Hamming/L2 brute-force matching "
+                              "with a learned matcher for the main per-frame tracking match "
+                              "only (§VI-C new-point search, loop-closure 3D-3D matching, and "
+                              "the rotation-only fallback stay on classical matching even in "
+                              "fully-learned mode - see issue #38). Requires --learned-detector "
+                              "(off by default, None): a learned matcher trained against "
+                              "SuperPoint's specific descriptor distribution has no defined "
+                              "behavior on ORB's binary descriptors, so this combination is "
+                              "rejected explicitly rather than run undefined")
     parser.add_argument("--ratio", type=float, default=0.75, help="Lowe's ratio test threshold")
     parser.add_argument("--min-parallax", type=float, default=10.0,
                          help="Minimum median pixel displacement vs the reference frame "
@@ -2323,7 +2405,16 @@ def _demo():
                               "exists so a lean baseline for v2 ML-fusion work (#58) can opt "
                               "out, not to change anyone else's default behavior - a genuinely "
                               "planar scene (e.g. freiburg3_nostructure_texture_far) needs the "
-                              "dual-model check to avoid a corrupted bootstrap")
+                              "dual-model check to avoid a corrupted bootstrap. With "
+                              "--learned-detector also set, this path additionally rejects a "
+                              "candidate bootstrap that triangulates fewer than --min-inliers's "
+                              "own dual-model-path standard (min_triangulated=50) points instead "
+                              "of accepting on RANSAC pose-inlier count alone - kept OFF for "
+                              "plain ORB specifically because enabling it there was confirmed to "
+                              "deterministically regress #58's own recorded freiburg1_xyz lean "
+                              "baseline via OpenCV's process-global unseeded RANSAC state "
+                              "(EVALUATION_METHOD.md pitfall #3), even though the underlying gap "
+                              "it closes is real for any detector - see issue #38")
     parser.add_argument("--pnp-min-inliers", type=int, default=20,
                          help="Minimum PnP inliers required to accept a tracked frame's pose "
                               "(checked every frame, not just when it becomes a keyframe)")
@@ -2712,9 +2803,14 @@ def _demo():
         parser.error("--depth-densify requires --model")
     if args.appearance_relocalize and not args.relocalize:
         parser.error("--appearance-relocalize requires --relocalize")
+    if args.learned_matcher and not args.learned_detector:
+        parser.error("--learned-matcher requires --learned-detector")
 
     grid_rows, grid_cols = (int(v) for v in args.grid.lower().split("x"))
-    sparse_map = Map()
+    sparse_map = (
+        Map(descriptor_dim=256, descriptor_dtype=np.float32, descriptor_metric="l2")
+        if args.learned_detector else Map()
+    )
 
     R_pos = np.eye(3)
     t_pos = np.zeros((3, 1))
@@ -2862,6 +2958,17 @@ def _demo():
     # for visual sanity-checking (see below) - never fed into sparse_map.
     depth_estimator = DepthEstimator(args.model) if args.depth_densify else None
     ml_points = np.empty((0, 3), dtype=np.float64)
+
+    # --learned-detector/--learned-matcher (#38) state: SuperPoint replaces
+    # ORB detection entirely when set; LightGlue additionally replaces only
+    # the main ref-frame-vs-current-frame match below (bootstrap parallax/
+    # pose) - the §VI-C new-point search, loop-closure 3D-3D matching, and
+    # the rotation-only fallback stay on classical (Hamming/L2)
+    # match_descriptors even in fully-learned mode (see --learned-matcher's
+    # own --help and issue #38).
+    superpoint_estimator = SuperPointEstimator(args.learned_detector) if args.learned_detector else None
+    lightglue_matcher = LightGlueMatcher(args.learned_matcher) if args.learned_matcher else None
+    descriptor_metric = "l2" if args.learned_detector else "hamming"
     last_depth_vis = None
     depth_rows = None
 
@@ -2888,10 +2995,16 @@ def _demo():
         delay_ms = max(1, int(1000 / fps))
 
         for frame in frames:
-            kp, desc = detect_and_compute_gridded(
-                frame.image, args.n_features, grid=(grid_rows, grid_cols),
-                fallback_thresholds=() if args.orb_single_pass else (10, 5),
-            )
+            if superpoint_estimator is not None:
+                kp, desc = superpoint_estimator.detect_and_compute(
+                    frame.image, args.n_features,
+                    pyramid_n_levels=sparse_map.pyramid_n_levels,
+                )
+            else:
+                kp, desc = detect_and_compute_gridded(
+                    frame.image, args.n_features, grid=(grid_rows, grid_cols),
+                    fallback_thresholds=() if args.orb_single_pass else (10, 5),
+                )
 
             if ref_desc is None:
                 ref_kp, ref_desc, ref_image = kp, desc, frame.image
@@ -2905,7 +3018,12 @@ def _demo():
             frames_since_last_keyframe += 1
             frames_since_relocalization += 1
 
-            matches_ref = match_descriptors(ref_desc, desc, args.ratio)
+            if lightglue_matcher is not None:
+                matches_ref = lightglue_matcher.match(
+                    ref_kp, ref_desc, ref_image.shape[:2], kp, desc, frame.image.shape[:2],
+                )
+            else:
+                matches_ref = match_descriptors(ref_desc, desc, args.ratio, metric=descriptor_metric)
 
             status = "insufficient matches"
             parallax = 0.0
@@ -2937,6 +3055,7 @@ def _demo():
                         max_reproj_chi2=args.triangulation_max_reproj_chi2,
                         max_scale_ratio_factor=args.triangulation_scale_ratio_factor,
                         essential_only=args.essential_only_bootstrap,
+                        essential_only_min_triangulated_floor=bool(args.learned_detector),
                     )
                     if result is None:
                         status = "bootstrap pose estimation failed"
@@ -3552,7 +3671,7 @@ def _demo():
                 ):
                     n_rotation_fallback_attempts += 1
                     rf_start = time.perf_counter()
-                    frame_matches = match_descriptors(prev_frame_desc, desc, args.ratio)
+                    frame_matches = match_descriptors(prev_frame_desc, desc, args.ratio, metric=descriptor_metric)
                     if len(frame_matches) >= 8:
                         rf_pts1 = np.float32([prev_frame_kp[m.queryIdx].pt for m in frame_matches])
                         rf_pts2 = np.float32([kp[m.trainIdx].pt for m in frame_matches])
