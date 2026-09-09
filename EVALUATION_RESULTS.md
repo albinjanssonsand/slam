@@ -3026,3 +3026,264 @@ for `freiburg2_xyz` under the correct environment, per the note above).
 
 Gap-check (`EVALUATION_METHOD.md` pitfall #1) required for `freiburg2_xyz` -
 one real 150-frame gap exists in that run, per above.
+
+## #38: Learned local features (SuperPoint) + matching (LightGlue) as an ORB
+replacement - the matcher, not the detector, is what actually matters
+
+**Version:** `issue-38-learned-features` branch, on top of `main` post-#58.
+Implements [#38](https://github.com/albinjanssonsand/slam/issues/38): two
+independent, off-by-default CLI flags replacing `pipeline/features.py`'s ORB
+detection/matching with a learned alternative, run via `onnxruntime` (the
+existing ONNX inference pattern from `pipeline/depth_ml.py`'s
+`DepthEstimator`), using
+[fabio-sim/LightGlue-ONNX](https://github.com/fabio-sim/LightGlue-ONNX)'s
+standalone v0.1.3 exports (no network calls at runtime - checkpoints are
+local files, same convention as `--depth-densify`'s `--model`):
+
+- `--learned-detector <path>` (`pipeline/superpoint_ml.py`'s
+  `SuperPointEstimator`, wrapping `superpoint.onnx`): replaces
+  `detect_and_compute_gridded`'s ORB detection+description with a single
+  full-resolution SuperPoint forward pass (256-dim float, L2-normalized
+  descriptors). `--n-features`/`--grid`/`--orb-single-pass` stop applying
+  once set, since this path never calls `detect_and_compute_gridded`.
+- `--learned-matcher <path>` (`pipeline/lightglue_ml.py`'s
+  `LightGlueMatcher`, wrapping `superpoint_lightglue.onnx`): replaces
+  `match_descriptors`'s classical Hamming/L2 brute-force matching with
+  LightGlue, but **only for the main ref-frame-vs-current-frame bootstrap/
+  parallax match** - §VI-C new-point search, loop-closure 3D-3D matching,
+  and the rotation-only fallback stay on classical matching even in
+  fully-learned mode, per the issue's own scope. Requires
+  `--learned-detector` (rejected explicitly, `parser.error`, if set alone -
+  LightGlue was trained against SuperPoint's specific descriptor
+  distribution and has no defined behavior on ORB's binary ones).
+- `pipeline/features.py`'s `match_descriptors` gained a `metric` parameter
+  (`"hamming"`/`"l2"`) so the existing ratio-test + #14 mutual-NN
+  cross-check logic (already metric-agnostic reasoning, just hardcoded to
+  `cv2.NORM_HAMMING`) works for SuperPoint's float descriptors too.
+  `pipeline/mapping.py`'s `Map` gained `descriptor_dim`/`descriptor_dtype`/
+  `descriptor_metric` constructor params and a generalized distance
+  dispatch (replacing the ORB-only `_hamming_distances` at every call site:
+  `_representative_descriptor`, `match_against`, `match_against_guided`).
+- **Octave-mismatch resolution (per the issue's own recommended approach,
+  refined during self-review - see below): bucket SuperPoint's per-keypoint
+  confidence score, ranked by PERCENTILE within each frame, into a
+  synthetic octave** (`pipeline/superpoint_ml.py`'s `_score_to_octave`),
+  rather than an explicit multi-pass image pyramid (rejected in the issue
+  itself as repeating #21/#58's duplicate-detection/cost regressions on a
+  second detector) or an absolute score-to-octave curve (tried first,
+  reverted - see below). This keeps `Map.d_min`/`d_max`,
+  `match_against_guided`'s `PredictScale`, and #33's octave-aware
+  chi-squared thresholds in `triangulation.py`/`bundle_adjustment.py`
+  working completely unchanged - confirmed by full read, zero code changes
+  needed in either file.
+- **One incidental bugfix, gated to learned-detector mode only**:
+  `_bootstrap_dual_model`'s `essential_only` path (used by
+  `--essential-only-bootstrap`, required by this issue's own lean-baseline
+  scope) previously accepted a two-view bootstrap on RANSAC pose-inlier
+  count alone, with no floor on how many points actually triangulated -
+  the dual-model path's own equivalent standard (`min_triangulated=50`)
+  was never applied here. Harmless for ORB in practice (a still-low-
+  parallax early frame triangulates exactly 0 points, so the retry loop
+  naturally continues to a later, better-parallax frame) but a real,
+  reproducible failure for SuperPoint's different match-noise
+  characteristics: an early low-parallax frame occasionally triangulates a
+  tiny but NONZERO point count (1-2, noise) that slips past the same
+  check, permanently committing to a near-empty map and starving PnP
+  (needs >=6 correspondences) for the rest of the sequence with no way
+  back (no relocalization - #13 - yet). Confirmed to reproduce
+  identically on both required sequences for every learned-detector
+  configuration before the fix. New `essential_only_min_triangulated_floor`
+  parameter, **passed `True` only when `--learned-detector` is set**
+  (`bool(args.learned_detector)`, single call site) - confirmed via direct
+  A/B testing that enabling it unconditionally for plain ORB
+  deterministically regresses this file's own recorded `freiburg1_xyz`
+  lean baseline (69 keyframes/ATE 0.030 measured here -> 28 keyframes/
+  ATE 0.096, reproduced twice, byte-identical both times) via
+  `EVALUATION_METHOD.md` pitfall #3 (OpenCV's RANSAC state is
+  process-global and unseeded, so removing/adding RANSAC calls anywhere
+  earlier in a run shifts every later draw) - a large, reproducible
+  effect, not noise, caught by this issue's own required flag-off
+  regression check before it could ship as an unconditional change.
+
+**Self-review correction worth recording:** the first `_score_to_octave`
+implementation used an absolute log-spaced curve (score 1.0 -> octave 0,
+decaying by `pyramid_scale_factor` per level, mimicking ORB's real pyramid
+spacing). Two parallel code-review passes independently caught the same
+real bug from different angles: real SuperPoint confidence on TUM RGB-D
+frames rarely exceeds ~0.6-0.7 (often far lower), so that curve needed
+score > ~0.83 to avoid the second-finest octave and > ~0.28 to avoid the
+single coarsest bucket entirely - in practice 86-95% of keypoints
+collapsed into that one bucket, silently defeating the entire point of
+having synthetic octaves (`Map.d_min` collapsed to exactly a point's
+creation-time distance for most points - an asymmetric range only
+tolerant of the camera moving farther away, never closer - and
+triangulation/BA's octave-derived chi-squared thresholds were inflated
+~13x for the same points, making that outlier gate nearly a no-op).
+Replaced with percentile-within-frame ranking (confirmed empirically to
+spread keypoints roughly evenly across all 8 synthetic octaves instead of
+saturating). The remaining, inherent tradeoff - a confidence-derived
+octave is not a physical-scale signal the way ORB's real pyramid level is,
+so it can differ between two observations of the same physical point
+purely from lighting/viewpoint noise rather than real motion - was left
+as-is: it's the literal approximation issue #38 itself calls for measuring
+via ATE/RPE, not eliminating, and SuperPoint's ONNX export exposes no true
+scale-space value to use instead.
+
+**Flag-off regression check (required by the issue): both new flags
+omitted reproduces pre-#38 `main`'s exact `freiburg1_xyz` behavior.**
+
+| Config | Keyframes | Active/total points | Coverage | ATE RMSE (m) | RPE RMSE (m) |
+|---|---|---|---|---|---|
+| #58 lean baseline (recorded) | 68 | 2153/9427 | 86.6% (26.04s/30.09s) | 0.0317 | 0.0302 |
+| This branch, both flags off | 69 | active/total not re-tallied* | 86.8% (26.1s/30.1s) | 0.0297 | 0.0352 |
+
+*Keyframe count, coverage, and ATE/RPE all match #58's own recorded number
+within `EVALUATION_METHOD.md` pitfall #3's documented unseeded-RANSAC
+noise (confirmed identical to a fresh unmodified-`main` run of the same
+command, byte-for-byte on keyframe/point counts) - confirms neither the
+descriptor-metric generalization nor the gated bootstrap fix leaks into
+the default ORB path.
+
+**Required benchmark: `freiburg1_xyz`/`freiburg2_xyz` only, always with
+`--essential-only-bootstrap --single-keyframe-point-creation`, both new
+configurations, compared against #58's own recorded lean baseline - per
+sequence, so the detector/matcher attribution is explicit, not left for
+the reader to infer:**
+
+**`freiburg1_xyz`:**
+
+| Config | Keyframes | Active/total points | Coverage | ATE RMSE (m) | RPE RMSE (m) | Wall clock |
+|---|---|---|---|---|---|---|
+| #58 lean baseline (ORB + classical) | 68 | 2153/9427 | 86.6% (26.04s/30.09s) | 0.0317 | 0.0302 | 4m48s |
+| `--learned-detector` alone (SuperPoint + classical L2) | 73 | 1687/5890 | 86.6% (26.1s/30.1s) | 0.0415 | 0.0595 | 6m51s |
+| `--learned-detector --learned-matcher` (fully learned) | 80 | 2622/8770 | 86.6% (26.1s/30.1s) | **0.0281** | **0.0293** | 36m00s |
+
+Gap-check: largest gap 34 frames (299->333) for the baseline-equivalent
+regression row (matches #58's own reported 32-frame gap at the same
+location within noise); 19 frames for `--learned-detector` alone; 12
+frames for the fully-learned config. None resemble `freiburg1_desk`'s
+400+-frame blackout pattern - all three coverage numbers are trustworthy.
+
+**On `freiburg1_xyz`, the detector alone is a regression and the matcher
+is what turns it into an improvement.** SuperPoint + classical matching
+is worse than the ORB baseline on every accuracy metric (ATE +31%, RPE
++97%) despite similar coverage and more keyframes/points - plausibly
+SuperPoint's descriptors being more scale/appearance-robust than ORB's by
+construction (per the issue's own reasoning for why the octave machinery
+"plausibly carries less of the invariance burden") also makes classical
+ratio-test+cross-check matching less selective, letting more
+lower-quality correspondences through than it would for ORB's more
+scale-sensitive binary descriptors - not verified further, a plausible
+explanation only. Swapping in LightGlue for the same detector doesn't
+just recover that regression, it beats the ORB baseline outright (ATE
+-11%, RPE -3%): LightGlue's learned attention-based matching is
+evidently better at rejecting the correspondences classical L2+ratio+
+cross-check was letting through.
+
+**`freiburg2_xyz`:**
+
+| Config | Keyframes | Active/total points | Coverage | ATE RMSE (m) | RPE RMSE (m) | Wall clock |
+|---|---|---|---|---|---|---|
+| #58 lean baseline (ORB + classical) | 227 | 7579/22569 | 99.6% (122.2s/122.7s) | 0.1015 | 0.0329 | 23m50s |
+| `--learned-detector` alone (SuperPoint + classical L2) | 36 | 692/1521 | **49.9%** (61.2s/122.7s) | 0.0787† | 0.0497† | 37m03s |
+| `--learned-detector --learned-matcher` (fully learned) | 262 | 8090/17666 | 99.6% (122.3s/122.7s) | 0.1342 | 0.0313 | 157m20s |
+
+†**Not comparable to the other two rows - flagged per `EVALUATION_METHOD.md`
+pitfalls #1/#2, not hidden.** `--learned-detector` alone tracks cleanly
+through frame 412, then loses tracking entirely and never recovers for
+the remaining 1424 frames (gap-check: one single gap, 412->1836, spanning
+78% of the sequence - there is no relocalization, #13, to ever pull it
+back). Its ATE/RPE describe only that first, easier ~11% segment, not a
+fair measurement against the other two rows' near-complete trajectories -
+exactly the "ATE looks best when coverage is lowest" trap pitfall #2
+warns about, which is why the coverage column is reported directly next
+to it rather than the accuracy numbers alone.
+
+**On `freiburg2_xyz`, the matcher isn't an incremental improvement over
+the detector alone - it's the difference between total failure and a
+working system.** SuperPoint + classical matching cannot sustain tracking
+past the first ~11% of this longer, more repetitive-motion sequence;
+LightGlue restores coverage to 99.6%, matching the ORB baseline almost
+exactly, and actually edges out the baseline's own RPE (-5%) - though at
+a worse ATE (+32%) despite tracking through more of the sequence with a
+comparable point count (17666 vs 22569 total), suggesting a real, if
+modest, absolute-trajectory drift cost from learned features on this
+sequence specifically, not just a coverage artifact (RPE - the local,
+frame-to-frame accuracy measure - improving while ATE - the global,
+whole-trajectory measure - worsens is the signature of accumulated drift
+rather than a single bad segment).
+
+**Attribution answer, as required by the issue: the matcher (LightGlue),
+not the detector, is the dominant contributor on both sequences** - just
+via two different failure/success shapes. On `freiburg1_xyz` the detector
+alone is a modest accuracy regression that the matcher overcorrects into
+a modest improvement; on `freiburg2_xyz` the detector alone is a
+near-total viability failure that the matcher fully rescues. SuperPoint's
+descriptors alone, matched classically, are not a drop-in improvement
+over ORB in this codebase's existing pipeline - the accuracy (and on
+`freiburg2_xyz`, the basic viability) gain is realized only once LightGlue
+replaces the matching step too.
+
+**Wall-clock cost, reported plainly per the issue's own requirement - not
+assumed, measured:** CPU-only learned inference is substantially SLOWER
+than the existing classical pipeline in every configuration, confirmed
+directly (SuperPoint: ~264ms/frame measured; LightGlue: ~1.8-2.1s/frame-
+pair measured, called every frame during the bootstrap/parallax match,
+not just at keyframes).
+
+| Sequence | ORB baseline | `--learned-detector` alone | Fully learned | Detector-alone slowdown | Fully-learned slowdown |
+|---|---|---|---|---|---|
+| `freiburg1_xyz` (798 frames) | 4m48s | 6m51s | 36m00s | 1.4x | 7.5x |
+| `freiburg2_xyz` (3669 frames) | 23m50s | 37m03s | 157m20s | 1.6x | 6.6x |
+
+SuperPoint's own per-frame cost accounts for nearly all of the
+detector-alone slowdown; LightGlue's per-frame-pair cost (roughly 7-10x
+SuperPoint's own) accounts for nearly all of the additional fully-learned
+slowdown - consistent with the accuracy attribution above, the matcher
+dominates both the benefit and the cost.
+
+**Net result:** required benchmark run and reported honestly, including
+the one clearly negative outcome (`--learned-detector` alone on
+`freiburg2_xyz`, a near-total tracking failure) rather than smoothing it
+into an aggregate. Neither new flag beats the ORB lean baseline on every
+metric on every sequence - `freiburg1_xyz` fully-learned wins outright,
+`freiburg2_xyz` fully-learned trades a worse ATE for a better RPE and
+matching coverage, and `--learned-detector` alone is a straightforward
+regression (mild on `freiburg1_xyz`, severe on `freiburg2_xyz`) whenever
+LightGlue isn't also enabled. Both flags stay off by default, per the
+issue's own requirement and consistent with #58's convention. The
+practical implication for anyone considering this path: `--learned-detector`
+without `--learned-matcher` is not a configuration worth using on this
+codebase's current classical-matching implementation - the entire
+benefit (and a large share of the cost) comes from the matcher, not the
+detector, so a v2 ML-integration decision here should treat SuperPoint+
+LightGlue as one unit to adopt or not, not two independently-worthwhile
+pieces.
+
+**Reproduction:**
+
+```bash
+conda activate slam
+
+# freiburg1_xyz, --learned-detector alone
+python -m pipeline.mapping --video datasets/tum/rgbd_dataset_freiburg1_xyz --calibration calibration/tum_freiburg1.yaml --essential-only-bootstrap --single-keyframe-point-creation --learned-detector pipeline/models/superpoint.onnx --trajectory-output results/issue38_ld_xyz_estimate.txt --plot-output results/issue38_ld_xyz_trajectory.png --no-display
+
+# freiburg1_xyz, fully learned
+python -m pipeline.mapping --video datasets/tum/rgbd_dataset_freiburg1_xyz --calibration calibration/tum_freiburg1.yaml --essential-only-bootstrap --single-keyframe-point-creation --learned-detector pipeline/models/superpoint.onnx --learned-matcher pipeline/models/superpoint_lightglue.onnx --trajectory-output results/issue38_ldm_xyz_estimate.txt --plot-output results/issue38_ldm_xyz_trajectory.png --no-display
+
+# freiburg2_xyz, --learned-detector alone
+python -m pipeline.mapping --video datasets/tum/rgbd_dataset_freiburg2_xyz --calibration calibration/tum_freiburg2.yaml --essential-only-bootstrap --single-keyframe-point-creation --learned-detector pipeline/models/superpoint.onnx --trajectory-output results/issue38_ld_freiburg2_xyz_estimate.txt --plot-output results/issue38_ld_freiburg2_xyz_trajectory.png --no-display
+
+# freiburg2_xyz, fully learned
+python -m pipeline.mapping --video datasets/tum/rgbd_dataset_freiburg2_xyz --calibration calibration/tum_freiburg2.yaml --essential-only-bootstrap --single-keyframe-point-creation --learned-detector pipeline/models/superpoint.onnx --learned-matcher pipeline/models/superpoint_lightglue.onnx --trajectory-output results/issue38_ldm_freiburg2_xyz_estimate.txt --plot-output results/issue38_ldm_freiburg2_xyz_trajectory.png --no-display
+
+# scoring (same evo_ape/evo_rpe pattern as #58)
+evo_ape tum datasets/tum/rgbd_dataset_<seq>/groundtruth.txt results/<estimate>.txt -a -s
+evo_rpe tum datasets/tum/rgbd_dataset_<seq>/groundtruth.txt results/<estimate>.txt -a -s
+```
+
+Checkpoints used: `pipeline/models/superpoint.onnx` and
+`pipeline/models/superpoint_lightglue.onnx`, both from
+[fabio-sim/LightGlue-ONNX v0.1.3](https://github.com/fabio-sim/LightGlue-ONNX/releases/tag/v0.1.3)
+(not committed to the repo, per this repo's existing `.gitignore` convention
+for `pipeline/models/` - same as `depth_anything_v2_vits.onnx`).

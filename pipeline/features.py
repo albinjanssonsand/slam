@@ -155,9 +155,9 @@ def detect_and_compute_gridded(image, n_features=2000, grid=(4, 4), fallback_thr
     return all_keypoints, np.vstack(all_descriptors)
 
 
-def match_descriptors(desc1, desc2, ratio=0.75):
+def match_descriptors(desc1, desc2, ratio=0.75, metric="hamming"):
     """
-    Brute-force Hamming matching with Lowe's ratio test, followed by a
+    Brute-force matching with Lowe's ratio test, followed by a
     mutual-nearest-neighbor cross-check: a forward match desc1[i]->desc2[j]
     is kept only if desc2[j]'s own best match in desc1 is also i. The ratio
     test alone only asks "is the best candidate much better than the
@@ -165,12 +165,16 @@ def match_descriptors(desc1, desc2, ratio=0.75):
     wallpaper, room corners) can pass easily even when the match is wrong;
     cross-check catches many of those since a wrong match's target usually
     has some other, unrelated descriptor as its own true nearest neighbor.
+    This reasoning is distance-metric-agnostic, hence the pluggable
+    `metric` ("hamming" for ORB's binary descriptors, "l2" for float
+    descriptors e.g. SuperPoint's - see issue #38).
     Returns a list of cv2.DMatch, sorted by distance (best first).
     """
     if desc1 is None or desc2 is None or len(desc1) < 2 or len(desc2) < 2:
         return []
 
-    matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
+    norm = {"hamming": cv2.NORM_HAMMING, "l2": cv2.NORM_L2}[metric]
+    matcher = cv2.BFMatcher(norm)
     knn_matches = matcher.knnMatch(desc1, desc2, k=2)
 
     good = []
