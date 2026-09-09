@@ -21,3 +21,17 @@ datasets/
 # Result outputs
 results/
 
+# Reference papers (copyrighted, linked from README instead)
+papers/
+
+# Editor/tooling config (personal, not project config)
+.vscode/
+.claude/
+
+# Personal working notes, not public-facing
+NOTES.md
+V2_INTEGRATION_PLAN.md
+
+# Device-specific calibration
+calibration/phone_camera.yaml
+
