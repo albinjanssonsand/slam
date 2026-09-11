@@ -2,24 +2,23 @@
 
 A monocular visual SLAM system built from scratch in Python (OpenCV,
 NumPy/SciPy), following the reference paper,
-[ORB-SLAM](https://arxiv.org/abs/1502.00956) (bootstrap, PnP tracking,
-keyframe mapping, bundle adjustment, loop closure, relocalization), then
-leaned down for a CPU-only budget and extended with learned components
-(SuperPoint, LightGlue, CLIP, via ONNX Runtime).
+[ORB-SLAM (Mur-Artal et al., 2015)](https://arxiv.org/abs/1502.00956) (bootstrap, PnP tracking,
+keyframe mapping, bundle adjustment, loop closure, relocalization). Then
+streamlined the pipeline for a CPU-only budget and extended it with two neaural network-based components (SuperPoint, LightGlue, via ONNX Runtime), aiming to test whether learned components could improve robustness in classically hard conditions for SLAM, such as rotation-only motion or low-texture scenes.
 
 **Highlights:**
-- **Leaning the pipeline for CPU-only execution made it ~4x faster and more accurate** (`freiburg1_xyz` ATE RMSE 0.0702m → 0.0317m)
-- **Adding SuperPoint + LightGlue pushed accuracy further on `freiburg1_xyz`**
+- **Streamlining the pipeline for CPU-only execution made it ~4x faster and reduced tracking error by ~55% (ATE RMSE: 0.0702m → 0.0317m) on the `TUM RGB-D freiburg1_xyz` benchmark dataset**
+- **Adding SuperPoint + LightGlue pushed accuracy further on `TUM RGB-D freiburg1_xyz`**
 
 ## Demo
 
-Live tracking and map using the lean pipeline on `freiburg1_xyz`:
+![Demo: streamlined pipeline live tracking on freiburg1_xyz](docs/media/demo.gif)
 
-![Demo: lean pipeline live tracking on freiburg1_xyz](docs/media/demo.gif)
+Live tracking and map using the streamlined pipeline on `TUM RGB-D freiburg1_xyz`. Left: reference keyframe, with keypoints matched to the live frame. Middle: live camera view. Right: map of keypoints and trajectory, top-down view.
 
 ## Results
 
-Scored against ground truth on the TUM RGB-D benchmark with `evo`, RMSE in
+Scored against ground truth on the [TUM RGB-D](https://cvg.cit.tum.de/data/datasets/rgbd-dataset) benchmark with `evo`, RMSE in
 meters. Absolute Trajectory Error (ATE): global drift over the whole
 trajectory, and Relative Pose Error (RPE): frame-to-frame drift.
 
@@ -37,24 +36,24 @@ below), placed right above or below the tables it corroborates.
 | Configuration | Coverage | ATE RMSE (m) | RPE RMSE (m) | Runtime |
 |---|---|---|---|---|
 | Paper-parity pipeline† | 86.5% | 0.0702 | 0.0898 | ~20 min |
-| **Lean pipeline** | 86.6% | 0.0317 | 0.0302 | **4m48s** |
+| **Streamlined pipeline** | 86.6% | 0.0317 | 0.0302 | **4m48s** |
 | &nbsp;&nbsp;&nbsp;&nbsp;+ SuperPoint detector | 86.6% | 0.0415 | 0.0595 | 6m51s |
 | &nbsp;&nbsp;&nbsp;&nbsp;+ SuperPoint detector + LightGlue matcher | 86.6% | **0.0281** | **0.0293** | 36m00s |
 
-† No lean-config flags: matches the reference paper's architecture (see
+† No streamlining flags: matches the reference paper's architecture (see
 [Architecture](#architecture)), not its accuracy.
 
 **`freiburg2_xyz`** (3669 frames, 122.7s):
 
 | Configuration | Coverage | ATE RMSE (m) | RPE RMSE (m) | Runtime |
 |---|---|---|---|---|
-| **Lean pipeline** | 99.6% | 0.1015 | 0.0329 | 23m50s |
+| **Streamlined pipeline** | 99.6% | 0.1015 | 0.0329 | 23m50s |
 | &nbsp;&nbsp;&nbsp;&nbsp;+ SuperPoint detector | \* | \* | \* | \* |
 | &nbsp;&nbsp;&nbsp;&nbsp;+ SuperPoint detector + LightGlue matcher | 99.6% | 0.1342 | **0.0313** | 157m20s |
 
 \* Superpoint detector without learned LightGlue matcher fails tracking. Details in [EVALUATION_RESULTS.md](EVALUATION_RESULTS.md), section `#38`.
 
-**Leaning the pipeline:**
+**Streamlining the pipeline:**
 `--essential-only-bootstrap --single-keyframe-point-creation
 --orb-single-pass` swap three paper-fidelity mechanisms for cheaper
 alternatives, in keeping with this project's CPU-only constraint (see
@@ -153,7 +152,7 @@ pip install -r requirements.txt
 
 Download a [TUM RGB-D](https://cvg.cit.tum.de/data/datasets/rgbd-dataset)
 sequence (e.g. `rgbd_dataset_freiburg1_xyz`) into `datasets/tum/`, then run
-the lean pipeline, which opens a live tracking view by
+the streamlined pipeline, which opens a live tracking view by
 default:
 
 ```bash
@@ -185,7 +184,7 @@ evo_rpe tum datasets/tum/rgbd_dataset_freiburg1_xyz/groundtruth.txt results/esti
 
 **Done:**
 - Paper-parity pipeline, see [Architecture](#architecture).
-- Lean pipeline, see [Results](#results).
+- Streamlined pipeline, see [Results](#results).
 - Learned descriptor and matcher, SuperPoint + LightGlue, see
   [Results](#results).
 
@@ -212,6 +211,6 @@ assumed anywhere in this pipeline, for the classical geometry or
 the learned components. That's the direct motivation for two separate
 things: which ONNX models were chosen at all (small/distilled checkpoints
 over larger, more accurate ones that wouldn't run at an acceptable
-per-frame cost on CPU), and why the lean pipeline flags above exist (three
+per-frame cost on CPU), and why the streamlined-pipeline flags above exist (three
 paper-fidelity mechanisms that measurably cost real per-frame time,
 reverted to cheaper classical alternatives).
